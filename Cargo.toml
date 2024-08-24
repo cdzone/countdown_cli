@@ -1,0 +1,18 @@
+[package]
+name = "countdown_cli"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+lto = "thin"
+
+[dependencies]
+chrono = "0.4"
+tokio = { version = "1", features = ["full"] }
+ctrlc = "3.1.9"
+crossterm = "0.28.1"
+toml = "0.8.19"
+serde = "1.0.130"
+serde_derive = "1.0.130"
+colored = "2"
+clap = { version = "4", features = ["derive"] }
