@@ -33,40 +33,20 @@ struct CliArgs {
     config_file: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct Countdown {
     title: String,
     datetime: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct Config {
+#[derive(Debug, Clone, Deserialize)]
+pub struct CountDownConfig {
     countdown: Vec<Countdown>,
 }
 
-#[tokio::main]
-async fn main() {
-    let cli_args = CliArgs::parse();
-    let file_path = cli_args.config_file;
-
-    let mut file = match File::open(file_path.clone()) {
-        Ok(file) => file,
-        Err(_) => {
-            println!("Error: Cannot open file '{}'", file_path);
-            return;
-        }
-    };
-
-    let mut contents = String::new();
-    file.read_to_string(&mut contents).unwrap();
-
-    let config: Config = match toml::from_str(&contents) {
-        Ok(config) => config,
-        Err(_) => {
-            println!("Error: Invalid TOML file format");
-            return;
-        }
-    };
+pub async fn terminal_run(if_running: Arc<AtomicBool>, config: CountDownConfig) {
+    let mut stdout = stdout();
+    let mut run_count: usize = 0;
 
     let mut target_datetimes: Vec<(String, NaiveDateTime)> = config
         .countdown
@@ -84,22 +64,8 @@ async fn main() {
             }
         })
         .collect();
-
     target_datetimes.sort_by(|a, b| a.1.cmp(&b.1));
-
-    let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
-    ctrlc::set_handler(move || {
-        r.store(false, Ordering::SeqCst);
-    })
-    .expect("Error setting Ctrl-C handler");
-
-    let mut stdout = stdout();
-    let mut run_count: usize = 0;
-
-    while running.load(Ordering::SeqCst) {
-        let _messages = String::new();
-
+    while if_running.load(Ordering::SeqCst) {
         // Get the terminal size
         let (_terminal_width, terminal_height) = size().unwrap();
 
@@ -168,5 +134,46 @@ async fn main() {
         run_count += 1;
 
         sleep(StdDuration::from_millis(50)).await;
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let cli_args = CliArgs::parse();
+    let file_path = cli_args.config_file;
+
+    let mut file = match File::open(file_path.clone()) {
+        Ok(file) => file,
+        Err(_) => {
+            println!("Error: Cannot open file '{}'", file_path);
+            return;
+        }
+    };
+
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).unwrap();
+
+    let config: CountDownConfig = match toml::from_str(&contents) {
+        Ok(config) => config,
+        Err(_) => {
+            println!("Error: Invalid TOML file format");
+            return;
+        }
+    };
+
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+    })
+    .expect("Error setting Ctrl-C handler");
+
+    let config_for_spawn = config.clone();
+    let if_running_for_spawn = running.clone();
+
+    let countdown_handle =
+        tokio::spawn(async move { terminal_run(if_running_for_spawn, config_for_spawn).await });
+    while !countdown_handle.is_finished() {
+        sleep(StdDuration::from_millis(10)).await;
     }
 }
