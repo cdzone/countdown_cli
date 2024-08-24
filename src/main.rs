@@ -4,6 +4,7 @@ use colored::*;
 use crossterm::cursor::MoveTo;
 use crossterm::terminal::size;
 use crossterm::ExecutableCommand;
+use notify::osx_terminal_notifier;
 use serde_derive::Deserialize;
 use std::fs::File;
 use std::io::Read;
@@ -12,6 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tokio::time::sleep;
+
+mod notify;
 
 pub fn get_styles() -> clap::builder::Styles {
     use clap::builder::styling::*;
@@ -64,7 +67,9 @@ pub async fn terminal_run(if_running: Arc<AtomicBool>, config: CountDownConfig) 
             }
         })
         .collect();
+
     target_datetimes.sort_by(|a, b| a.1.cmp(&b.1));
+
     while if_running.load(Ordering::SeqCst) {
         // Get the terminal size
         let (_terminal_width, terminal_height) = size().unwrap();
@@ -110,7 +115,14 @@ pub async fn terminal_run(if_running: Arc<AtomicBool>, config: CountDownConfig) 
                         mills_left.bright_yellow()
                     )
                 }
-                0 => format!("{}: Now is the time!", title),
+                0 => {
+                    /*  TODO: notify how many time need be controlled precision,not like this fixed sleep.
+                    need fix it later.
+                    not play any sound for now.*/
+                    osx_terminal_notifier(title, "", None).await;
+                    sleep(StdDuration::from_millis(500)).await;
+                    format!("{}: Now is the time!", title)
+                }
                 i64::MIN..=-1_i64 => {
                     format!(
                         "{}: The datetime was {} seconds ago.",
