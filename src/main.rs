@@ -1,19 +1,18 @@
 use chrono::{Local, NaiveDateTime};
 use clap::Parser;
 use colored::*;
+use config::{CountDownConfig, HotReload};
 use crossterm::cursor::MoveTo;
 use crossterm::terminal::size;
 use crossterm::ExecutableCommand;
 use notify::osx_terminal_notifier;
-use serde_derive::Deserialize;
-use std::fs::File;
-use std::io::Read;
 use std::io::{stdout, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tokio::time::sleep;
 
+mod config;
 mod notify;
 
 pub fn get_styles() -> clap::builder::Styles {
@@ -36,22 +35,12 @@ struct CliArgs {
     config_file: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct Countdown {
-    title: String,
-    datetime: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct CountDownConfig {
-    countdown: Vec<Countdown>,
-}
-
 pub async fn terminal_run(if_running: Arc<AtomicBool>, config: CountDownConfig) {
     let mut stdout = stdout();
     let mut run_count: usize = 0;
 
-    let mut target_datetimes: Vec<(String, NaiveDateTime)> = config
+    while if_running.load(Ordering::SeqCst) {
+        let mut target_datetimes: Vec<(String, NaiveDateTime)> = config.get_config().await
         .countdown
         .into_iter()
         .filter_map(|countdown| {
@@ -68,9 +57,7 @@ pub async fn terminal_run(if_running: Arc<AtomicBool>, config: CountDownConfig) 
         })
         .collect();
 
-    target_datetimes.sort_by(|a, b| a.1.cmp(&b.1));
-
-    while if_running.load(Ordering::SeqCst) {
+        target_datetimes.sort_by(|a, b| a.1.cmp(&b.1));
         // Get the terminal size
         let (_terminal_width, terminal_height) = size().unwrap();
 
@@ -154,24 +141,7 @@ async fn main() {
     let cli_args = CliArgs::parse();
     let file_path = cli_args.config_file;
 
-    let mut file = match File::open(file_path.clone()) {
-        Ok(file) => file,
-        Err(_) => {
-            println!("Error: Cannot open file '{}'", file_path);
-            return;
-        }
-    };
-
-    let mut contents = String::new();
-    file.read_to_string(&mut contents).unwrap();
-
-    let config: CountDownConfig = match toml::from_str(&contents) {
-        Ok(config) => config,
-        Err(_) => {
-            println!("Error: Invalid TOML file format");
-            return;
-        }
-    };
+    let config = CountDownConfig::try_new(file_path).unwrap();
 
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -185,6 +155,13 @@ async fn main() {
 
     let countdown_handle =
         tokio::spawn(async move { terminal_run(if_running_for_spawn, config_for_spawn).await });
+    let mut config_for_reload = config.clone();
+    let _reload_handle = tokio::spawn(async move {
+        loop {
+            sleep(StdDuration::from_secs(1)).await;
+            let _ = config_for_reload.reload().await;
+        }
+    });
     while !countdown_handle.is_finished() {
         sleep(StdDuration::from_millis(10)).await;
     }
