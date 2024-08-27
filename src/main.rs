@@ -2,7 +2,6 @@ use chrono::{Local, NaiveDateTime};
 use clap::Parser;
 use colored::*;
 use config::{CountDownConfig, HotReload};
-use crossterm::cursor::MoveTo;
 use crossterm::terminal::size;
 use crossterm::ExecutableCommand;
 use notify::osx_terminal_notifier;
@@ -12,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tokio::time::sleep;
 
+mod command;
 mod config;
 mod notify;
 
@@ -62,13 +62,26 @@ pub async fn terminal_run(if_running: Arc<AtomicBool>, config: CountDownConfig) 
         let (_terminal_width, terminal_height) = size().unwrap();
 
         // Calculate the starting row for the messages
-        let starting_row = if terminal_height > target_datetimes.len() as u16 {
+        let _starting_row = if terminal_height > target_datetimes.len() as u16 {
             terminal_height - target_datetimes.len() as u16
         } else {
             0
         };
 
-        for (i, (title, target_datetime)) in target_datetimes.iter().enumerate() {
+        if run_count == 0 {
+            for _ in 0..target_datetimes.len() {
+                println!();
+            }
+        }
+
+        // print!("\r\x1B[K");
+        let _ = stdout.execute(command::OpsCommand(command::OpsCommandType::ClearToEnd));
+        for _ in 0..target_datetimes.len() {
+            // print!("\x1B[F");
+            let _ = stdout.execute(command::OpsCommand(command::OpsCommandType::UpOneLine));
+        }
+
+        for (title, target_datetime) in target_datetimes.iter() {
             let now = Local::now().naive_local();
             let remaining = *target_datetime - now;
             let remaining_seconds = remaining.num_seconds();
@@ -118,15 +131,15 @@ pub async fn terminal_run(if_running: Arc<AtomicBool>, config: CountDownConfig) 
                 }
             };
 
-            if run_count != 0 {
-                // Move the cursor to the correct position
-                stdout.execute(MoveTo(0, starting_row + i as u16)).unwrap();
-            } else {
-                println!();
-            }
+            // if run_count != 0 {
+            //     // Move the cursor to the correct position
+            //     stdout.execute(MoveTo(0, starting_row + i as u16)).unwrap();
+            // } else {
+            //     println!();
+            // }
 
             // Print the message
-            print!("{}", message);
+            println!("{}", message);
             stdout.flush().unwrap();
         }
 
