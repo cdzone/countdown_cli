@@ -1,5 +1,6 @@
 use crossterm::Command;
 
+#[allow(dead_code)]
 pub enum OpsCommandType {
     ClearToEnd,
     UpOneLine,
