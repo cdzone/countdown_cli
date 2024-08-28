@@ -2,8 +2,8 @@ use chrono::{Local, NaiveDateTime};
 use clap::Parser;
 use colored::*;
 use config::{CountDownConfig, HotReload};
-use crossterm::terminal::size;
-use crossterm::ExecutableCommand;
+use crossterm::terminal::{Clear, ClearType};
+use crossterm::{cursor, ExecutableCommand};
 use notify::osx_terminal_notifier;
 use std::io::{stdout, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,7 +37,7 @@ struct CliArgs {
 
 pub async fn terminal_run(if_running: Arc<AtomicBool>, config: CountDownConfig) {
     let mut stdout = stdout();
-    let mut run_count: usize = 0;
+    let mut last_line_count = 0;
 
     while if_running.load(Ordering::SeqCst) {
         let mut target_datetimes: Vec<(String, NaiveDateTime)> = config.get_config().await
@@ -58,28 +58,15 @@ pub async fn terminal_run(if_running: Arc<AtomicBool>, config: CountDownConfig) 
         .collect();
 
         target_datetimes.sort_by(|a, b| a.1.cmp(&b.1));
-        // Get the terminal size
-        let (_terminal_width, terminal_height) = size().unwrap();
 
-        // Calculate the starting row for the messages
-        let _starting_row = if terminal_height > target_datetimes.len() as u16 {
-            terminal_height - target_datetimes.len() as u16
-        } else {
-            0
-        };
-
-        if run_count == 0 {
-            for _ in 0..target_datetimes.len() {
-                println!();
-            }
+        // 清除之前的输出
+        for _ in 0..last_line_count {
+            let _ = stdout.execute(cursor::MoveUp(1));
+            let _ = stdout.execute(Clear(ClearType::CurrentLine));
         }
 
-        // print!("\r\x1B[K");
-        let _ = stdout.execute(command::OpsCommand(command::OpsCommandType::ClearToEnd));
-        for _ in 0..target_datetimes.len() {
-            // print!("\x1B[F");
-            let _ = stdout.execute(command::OpsCommand(command::OpsCommandType::UpOneLine));
-        }
+        // 将光标移回开始位置
+        let _ = stdout.execute(cursor::MoveToColumn(0));
 
         for (title, target_datetime) in target_datetimes.iter() {
             let now = Local::now().naive_local();
@@ -143,7 +130,8 @@ pub async fn terminal_run(if_running: Arc<AtomicBool>, config: CountDownConfig) 
             stdout.flush().unwrap();
         }
 
-        run_count += 1;
+        // 更新行数
+        last_line_count = target_datetimes.len();
 
         sleep(StdDuration::from_millis(50)).await;
     }
