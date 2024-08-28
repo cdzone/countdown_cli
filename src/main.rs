@@ -7,8 +7,11 @@ use crossterm::{cursor, ExecutableCommand};
 use notify::osx_terminal_notifier;
 use std::io::{stdout, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
-use std::time::Duration as StdDuration;
+use std::thread;
+use std::time::{Duration as StdDuration, Duration, Instant};
+use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 mod command;
@@ -35,11 +38,159 @@ struct CliArgs {
     config_file: String,
 }
 
+#[derive(Debug, PartialEq)]
+enum PomodoroState {
+    Idle,
+    Work,
+    ShortBreak,
+    LongBreak,
+}
+
+struct PomodoroTimer {
+    start_time: Option<Instant>,
+    work_duration: Duration,
+    short_break_duration: Duration,
+    long_break_duration: Duration,
+    state: PomodoroState,
+    completed_work_sessions: u32,
+    long_break_interval: u32,
+}
+
+impl PomodoroTimer {
+    fn new() -> Self {
+        PomodoroTimer {
+            start_time: None,
+            work_duration: Duration::from_secs(25 * 60),
+            short_break_duration: Duration::from_secs(5 * 60),
+            long_break_duration: Duration::from_secs(15 * 60),
+            state: PomodoroState::Idle,
+            completed_work_sessions: 0,
+            long_break_interval: 4,
+        }
+    }
+
+    fn start(&mut self) {
+        self.start_time = Some(Instant::now());
+        if self.state == PomodoroState::Idle {
+            self.state = PomodoroState::Work;
+        }
+    }
+
+    fn stop(&mut self) {
+        self.start_time = None;
+        self.state = PomodoroState::Idle;
+    }
+
+    fn remaining_time(&self) -> Option<Duration> {
+        self.start_time.map(|start| {
+            let elapsed = start.elapsed();
+            let duration = match self.state {
+                PomodoroState::Work => self.work_duration,
+                PomodoroState::ShortBreak => self.short_break_duration,
+                PomodoroState::LongBreak => self.long_break_duration,
+                PomodoroState::Idle => return Duration::from_secs(0),
+            };
+            if elapsed >= duration {
+                Duration::from_secs(0)
+            } else {
+                duration - elapsed
+            }
+        })
+    }
+
+    fn next_state(&mut self) {
+        match self.state {
+            PomodoroState::Work => {
+                self.completed_work_sessions += 1;
+                if self.completed_work_sessions % self.long_break_interval == 0 {
+                    self.state = PomodoroState::LongBreak;
+                } else {
+                    self.state = PomodoroState::ShortBreak;
+                }
+            }
+            PomodoroState::ShortBreak | PomodoroState::LongBreak => {
+                self.state = PomodoroState::Work;
+            }
+            PomodoroState::Idle => {}
+        }
+        self.start_time = Some(Instant::now());
+    }
+
+    fn set_work_duration(&mut self, minutes: u64) {
+        self.work_duration = Duration::from_secs(minutes * 60);
+    }
+
+    fn set_short_break_duration(&mut self, minutes: u64) {
+        self.short_break_duration = Duration::from_secs(minutes * 60);
+    }
+
+    fn set_long_break_duration(&mut self, minutes: u64) {
+        self.long_break_duration = Duration::from_secs(minutes * 60);
+    }
+
+    fn set_long_break_interval(&mut self, interval: u32) {
+        self.long_break_interval = interval;
+    }
+}
+
 pub async fn terminal_run(if_running: Arc<AtomicBool>, config: CountDownConfig) {
     let mut stdout = stdout();
     let mut last_line_count = 0;
+    let pomodoro = Arc::new(Mutex::new(PomodoroTimer::new()));
+
+    let (tx, rx) = std_mpsc::channel();
+
+    let if_running_clone = if_running.clone();
+    thread::spawn(move || {
+        handle_user_input(tx, if_running_clone);
+    });
+
+    let mut paused = false;
 
     while if_running.load(Ordering::SeqCst) {
+        if let Ok(command) = rx.try_recv() {
+            let mut pomodoro_lock = pomodoro.lock().await;
+            match command
+                .as_str()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                ["start"] => pomodoro_lock.start(),
+                ["stop"] => pomodoro_lock.stop(),
+                ["next"] => pomodoro_lock.next_state(),
+                ["work", duration] => {
+                    if let Ok(minutes) = duration.parse() {
+                        pomodoro_lock.set_work_duration(minutes);
+                    }
+                }
+                ["short", duration] => {
+                    if let Ok(minutes) = duration.parse() {
+                        pomodoro_lock.set_short_break_duration(minutes);
+                    }
+                }
+                ["long", duration] => {
+                    if let Ok(minutes) = duration.parse() {
+                        pomodoro_lock.set_long_break_duration(minutes);
+                    }
+                }
+                ["interval", count] => {
+                    if let Ok(interval) = count.parse() {
+                        pomodoro_lock.set_long_break_interval(interval);
+                    }
+                }
+                ["pause"] => paused = true,
+                ["resume"] => paused = false,
+                _ => println!("未知命令: {}", command),
+            }
+            drop(pomodoro_lock);
+        }
+
+        if paused {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+
         let mut target_datetimes: Vec<(String, NaiveDateTime)> = config.get_config().await
         .countdown
         .into_iter()
@@ -65,8 +216,39 @@ pub async fn terminal_run(if_running: Arc<AtomicBool>, config: CountDownConfig) 
             let _ = stdout.execute(Clear(ClearType::CurrentLine));
         }
 
-        // 将光标移回开始位置
         let _ = stdout.execute(cursor::MoveToColumn(0));
+
+        // 显示番茄钟状态
+        let pomodoro_lock = pomodoro.lock().await;
+        match pomodoro_lock.state {
+            PomodoroState::Idle => println!("番茄钟未启动"),
+            _ => {
+                if let Some(remaining) = pomodoro_lock.remaining_time() {
+                    println!(
+                        "番茄钟状态: {:?}, 剩余时间: {:02}:{:02}",
+                        pomodoro_lock.state,
+                        remaining.as_secs() / 60,
+                        remaining.as_secs() % 60
+                    );
+                    if remaining.as_secs() == 0 {
+                        println!("当前阶段结束！");
+                        drop(pomodoro_lock);
+                        pomodoro.lock().await.next_state();
+                        let pomodoro_lock = pomodoro.lock().await;
+                        println!(
+                            "已完成的工作周期: {}",
+                            pomodoro_lock.completed_work_sessions
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
+        println!(
+            "已完成的工作周期: {}",
+            pomodoro_lock.completed_work_sessions
+        );
+        drop(pomodoro_lock);
 
         for (title, target_datetime) in target_datetimes.iter() {
             let now = Local::now().naive_local();
@@ -118,27 +300,50 @@ pub async fn terminal_run(if_running: Arc<AtomicBool>, config: CountDownConfig) 
                 }
             };
 
-            // if run_count != 0 {
-            //     // Move the cursor to the correct position
-            //     stdout.execute(MoveTo(0, starting_row + i as u16)).unwrap();
-            // } else {
-            //     println!();
-            // }
-
-            // Print the message
             println!("{}", message);
             stdout.flush().unwrap();
         }
 
-        // 更新行数
-        last_line_count = target_datetimes.len();
+        last_line_count = target_datetimes.len() + 2; // +2 for the pomodoro timer lines
 
-        sleep(StdDuration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
+fn handle_user_input(tx: std_mpsc::Sender<String>, if_running: Arc<AtomicBool>) {
+    println!("输入 'help' 查看可用命令");
+
+    while if_running.load(Ordering::SeqCst) {
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_ok() {
+            let input = input.trim().to_string();
+            if input == "help" {
+                tx.send("pause".to_string()).unwrap();
+                print_help();
+                println!("按回车键继续...");
+                let _ = std::io::stdin().read_line(&mut String::new());
+                tx.send("resume".to_string()).unwrap();
+            } else {
+                tx.send(input).unwrap();
+            }
+        }
+    }
+}
+
+fn print_help() {
+    println!("可用命令：");
+    println!("start - 启动番茄钟");
+    println!("stop - 停止番茄钟");
+    println!("next - 手动切换到下一个状态");
+    println!("work <分钟> - 设置工作时间");
+    println!("short <分钟> - 设置短休息时间");
+    println!("long <分钟> - 设置长休息时间");
+    println!("interval <次数> - 设置长休息间隔（工作周期次数）");
+    println!("help - 显示此帮助信息");
+}
+
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli_args = CliArgs::parse();
     let file_path = cli_args.config_file;
 
@@ -159,11 +364,12 @@ async fn main() {
     let mut config_for_reload = config.clone();
     let _reload_handle = tokio::spawn(async move {
         loop {
-            sleep(StdDuration::from_secs(1)).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
             let _ = config_for_reload.reload().await;
         }
     });
-    while !countdown_handle.is_finished() {
-        sleep(StdDuration::from_millis(10)).await;
-    }
+
+    countdown_handle.await?;
+
+    Ok(())
 }
