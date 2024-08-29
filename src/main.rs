@@ -69,13 +69,6 @@ impl PomodoroTimer {
         }
     }
 
-    fn start(&mut self) {
-        self.start_time = Some(Instant::now());
-        if self.state == PomodoroState::Idle {
-            self.state = PomodoroState::Work;
-        }
-    }
-
     fn stop(&mut self) {
         self.start_time = None;
         self.state = PomodoroState::Idle;
@@ -102,17 +95,16 @@ impl PomodoroTimer {
         match self.state {
             PomodoroState::Work => {
                 self.completed_work_sessions += 1;
-                if self.completed_work_sessions % self.long_break_interval == 0 {
-                    self.state = PomodoroState::LongBreak;
-                } else {
-                    self.state = PomodoroState::ShortBreak;
-                }
             }
-            PomodoroState::ShortBreak | PomodoroState::LongBreak => {
-                self.state = PomodoroState::Work;
-            }
+            PomodoroState::ShortBreak | PomodoroState::LongBreak => {}
             PomodoroState::Idle => {}
         }
+        self.state = PomodoroState::Idle;
+        self.start_time = None;
+    }
+
+    fn set_state(&mut self, new_state: PomodoroState) {
+        self.state = new_state;
         self.start_time = Some(Instant::now());
     }
 
@@ -156,8 +148,10 @@ pub async fn terminal_run(if_running: Arc<AtomicBool>, config: CountDownConfig) 
                 .collect::<Vec<_>>()
                 .as_slice()
             {
-                ["start"] => pomodoro_lock.start(),
+                ["start"] => pomodoro_lock.set_state(PomodoroState::Work),
                 ["stop"] => pomodoro_lock.stop(),
+                ["short"] => pomodoro_lock.set_state(PomodoroState::ShortBreak),
+                ["long"] => pomodoro_lock.set_state(PomodoroState::LongBreak),
                 ["next"] => pomodoro_lock.next_state(),
                 ["work", duration] => {
                     if let Ok(minutes) = duration.parse() {
@@ -239,6 +233,7 @@ pub async fn terminal_run(if_running: Arc<AtomicBool>, config: CountDownConfig) 
                             "已完成的工作周期: {}",
                             pomodoro_lock.completed_work_sessions
                         );
+                        println!("请输入下一个命令（start/short/long）来开始新的阶段");
                         continue;
                     }
                 }
@@ -332,7 +327,9 @@ fn handle_user_input(tx: std_mpsc::Sender<String>, if_running: Arc<AtomicBool>) 
 
 fn print_help() {
     println!("可用命令：");
-    println!("start - 启动番茄钟");
+    println!("start - 开始工作阶段");
+    println!("short - 开始短休息阶段");
+    println!("long - 开始长休息阶段");
     println!("stop - 停止番茄钟");
     println!("next - 手动切换到下一个状态");
     println!("work <分钟> - 设置工作时间");
