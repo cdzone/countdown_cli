@@ -36,6 +36,8 @@ struct CliArgs {
         default_value = "config.toml"
     )]
     config_file: String,
+    #[arg(short = 's', long = "notify_sound", default_value = "")]
+    notify_sound: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -125,7 +127,11 @@ impl PomodoroTimer {
     }
 }
 
-pub async fn terminal_run(if_running: Arc<AtomicBool>, config: CountDownConfig) {
+pub async fn terminal_run(
+    if_running: Arc<AtomicBool>,
+    config: CountDownConfig,
+    notify_sound: Option<String>,
+) {
     let mut stdout = stdout();
     let mut last_line_count = 0;
     let pomodoro = Arc::new(Mutex::new(PomodoroTimer::new()));
@@ -228,6 +234,8 @@ pub async fn terminal_run(if_running: Arc<AtomicBool>, config: CountDownConfig) 
                         println!("当前阶段结束！");
                         drop(pomodoro_lock);
                         pomodoro.lock().await.next_state();
+                        osx_terminal_notifier("番茄钟：当前阶段结束！", "", notify_sound.clone())
+                            .await;
                         let pomodoro_lock = pomodoro.lock().await;
                         println!(
                             "已完成的工作周期: {}",
@@ -283,7 +291,7 @@ pub async fn terminal_run(if_running: Arc<AtomicBool>, config: CountDownConfig) 
                     /*  TODO: notify how many time need be controlled precision,not like this fixed sleep.
                     need fix it later.
                     not play any sound for now.*/
-                    osx_terminal_notifier(title, "", None).await;
+                    osx_terminal_notifier(title, "", notify_sound.clone()).await;
                     sleep(StdDuration::from_millis(500)).await;
                     format!("{}: Now is the time!", title)
                 }
@@ -343,6 +351,7 @@ fn print_help() {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli_args = CliArgs::parse();
     let file_path = cli_args.config_file;
+    let notify_sound = cli_args.notify_sound;
 
     let config = CountDownConfig::try_new(file_path).unwrap();
 
@@ -355,9 +364,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config_for_spawn = config.clone();
     let if_running_for_spawn = running.clone();
-
-    let countdown_handle =
-        tokio::spawn(async move { terminal_run(if_running_for_spawn, config_for_spawn).await });
+    let notify_sound_for_spawn = notify_sound.clone();
+    let countdown_handle = tokio::spawn(async move {
+        terminal_run(
+            if_running_for_spawn,
+            config_for_spawn,
+            notify_sound_for_spawn,
+        )
+        .await
+    });
     let mut config_for_reload = config.clone();
     let _reload_handle = tokio::spawn(async move {
         loop {
