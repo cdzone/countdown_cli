@@ -191,22 +191,25 @@ pub async fn terminal_run(
             continue;
         }
 
-        let mut target_datetimes: Vec<(String, NaiveDateTime)> = config.get_config().await
-        .countdown
-        .into_iter()
-        .filter_map(|countdown| {
-            match NaiveDateTime::parse_from_str(&countdown.datetime, "%Y-%m-%d %H:%M:%S") {
-                Ok(datetime) => Some((countdown.title, datetime)),
-                Err(_) => {
-                    println!(
-                        "Error: Invalid datetime format for '{}'. Please use 'YYYY-MM-DD HH:MM:SS' format.",
-                        countdown.title
-                    );
-                    None
+        let mut target_datetimes: Vec<(String, NaiveDateTime)> = config
+            .get_config()
+            .await
+            .countdown
+            .into_iter()
+            .filter(|countdown| countdown.enabled)
+            .filter_map(|countdown| {
+                match NaiveDateTime::parse_from_str(&countdown.datetime, "%Y-%m-%d %H:%M:%S") {
+                    Ok(datetime) => Some((countdown.title.clone(), datetime)),
+                    Err(_) => {
+                        println!(
+                            "错误：'{}' 的日期时间格式无效。请使用 'YYYY-MM-DD HH:MM:SS' 格式。",
+                            countdown.title
+                        );
+                        None
+                    }
                 }
-            }
-        })
-        .collect();
+            })
+            .collect();
 
         target_datetimes.sort_by(|a, b| a.1.cmp(&b.1));
 
