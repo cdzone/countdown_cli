@@ -10,6 +10,12 @@ pub trait HotReload {
 pub struct Countdown {
     pub title: String,
     pub datetime: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
