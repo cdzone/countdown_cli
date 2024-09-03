@@ -56,6 +56,7 @@ struct PomodoroTimer {
     state: PomodoroState,
     completed_work_sessions: u32,
     long_break_interval: u32,
+    last_completed_time: Option<Instant>,
 }
 
 impl PomodoroTimer {
@@ -68,6 +69,7 @@ impl PomodoroTimer {
             state: PomodoroState::Idle,
             completed_work_sessions: 0,
             long_break_interval: 4,
+            last_completed_time: None,
         }
     }
 
@@ -97,8 +99,11 @@ impl PomodoroTimer {
         match self.state {
             PomodoroState::Work => {
                 self.completed_work_sessions += 1;
+                self.last_completed_time = Some(Instant::now());
             }
-            PomodoroState::ShortBreak | PomodoroState::LongBreak => {}
+            PomodoroState::ShortBreak | PomodoroState::LongBreak => {
+                self.last_completed_time = Some(Instant::now());
+            }
             PomodoroState::Idle => {}
         }
         self.state = PomodoroState::Idle;
@@ -108,6 +113,7 @@ impl PomodoroTimer {
     fn set_state(&mut self, new_state: PomodoroState) {
         self.state = new_state;
         self.start_time = Some(Instant::now());
+        self.last_completed_time = None; // 清除上次完成时间
     }
 
     fn set_work_duration(&mut self, minutes: u64) {
@@ -125,8 +131,13 @@ impl PomodoroTimer {
     fn set_long_break_interval(&mut self, interval: u32) {
         self.long_break_interval = interval;
     }
+
+    fn time_since_last_completion(&self) -> Option<Duration> {
+        self.last_completed_time.map(|time| time.elapsed())
+    }
 }
 
+#[allow(unused_assignments)]
 pub async fn terminal_run(
     if_running: Arc<AtomicBool>,
     config: CountDownConfig,
@@ -221,10 +232,24 @@ pub async fn terminal_run(
 
         let _ = stdout.execute(cursor::MoveToColumn(0));
 
+        let mut current_line_count = 0;
+
         // 显示番茄钟状态
         let pomodoro_lock = pomodoro.lock().await;
         match pomodoro_lock.state {
-            PomodoroState::Idle => println!("番茄钟未启动"),
+            PomodoroState::Idle => {
+                if let Some(time_since_completion) = pomodoro_lock.time_since_last_completion() {
+                    println!(
+                        "番茄钟未启动，上次完成后已经过去: {:02}:{:02}",
+                        time_since_completion.as_secs() / 60,
+                        time_since_completion.as_secs() % 60
+                    );
+                    current_line_count += 1;
+                } else {
+                    println!("番茄钟未启动");
+                    current_line_count += 1;
+                }
+            }
             _ => {
                 if let Some(remaining) = pomodoro_lock.remaining_time() {
                     println!(
@@ -233,6 +258,7 @@ pub async fn terminal_run(
                         remaining.as_secs() / 60,
                         remaining.as_secs() % 60
                     );
+                    current_line_count += 1;
                     if remaining.as_secs() == 0 {
                         println!("当前阶段结束！");
                         drop(pomodoro_lock);
@@ -244,7 +270,9 @@ pub async fn terminal_run(
                             "已完成的工作周期: {}",
                             pomodoro_lock.completed_work_sessions
                         );
+                        current_line_count += 1;
                         println!("请输入下一个命令（start/short/long）来开始新的阶段");
+                        current_line_count += 1;
                         continue;
                     }
                 }
@@ -254,6 +282,7 @@ pub async fn terminal_run(
             "已完成的工作周期: {}",
             pomodoro_lock.completed_work_sessions
         );
+        current_line_count += 1;
         drop(pomodoro_lock);
 
         for (title, target_datetime) in target_datetimes.iter() {
@@ -307,10 +336,11 @@ pub async fn terminal_run(
             };
 
             println!("{}", message);
+            current_line_count += 1;
             stdout.flush().unwrap();
         }
 
-        last_line_count = target_datetimes.len() + 2; // +2 for the pomodoro timer lines
+        last_line_count = current_line_count;
 
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
