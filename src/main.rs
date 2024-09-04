@@ -155,6 +155,7 @@ pub async fn terminal_run(
     });
 
     let mut paused = false;
+    let mut clean_without_output = false;
 
     while if_running.load(Ordering::SeqCst) {
         if let Ok(command) = rx.try_recv() {
@@ -225,9 +226,11 @@ pub async fn terminal_run(
         target_datetimes.sort_by(|a, b| a.1.cmp(&b.1));
 
         // 清除之前的输出
-        for _ in 0..last_line_count {
-            let _ = stdout.execute(cursor::MoveUp(1));
-            let _ = stdout.execute(Clear(ClearType::CurrentLine));
+        if !clean_without_output {
+            for _ in 0..last_line_count {
+                let _ = stdout.execute(cursor::MoveUp(1));
+                let _ = stdout.execute(Clear(ClearType::CurrentLine));
+            }
         }
 
         let _ = stdout.execute(cursor::MoveToColumn(0));
@@ -273,6 +276,7 @@ pub async fn terminal_run(
                         current_line_count += 1;
                         println!("请输入下一个命令（start/short/long）来开始新的阶段");
                         current_line_count += 1;
+                        clean_without_output = true;
                         continue;
                     }
                 }
@@ -340,6 +344,7 @@ pub async fn terminal_run(
             stdout.flush().unwrap();
         }
 
+        clean_without_output = false;
         last_line_count = current_line_count;
 
         tokio::time::sleep(Duration::from_millis(50)).await;
