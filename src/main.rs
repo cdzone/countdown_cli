@@ -266,8 +266,12 @@ pub async fn terminal_run(
                         println!("当前阶段结束！");
                         drop(pomodoro_lock);
                         pomodoro.lock().await.next_state();
-                        osx_terminal_notifier("番茄钟：当前阶段结束！", "", notify_sound.clone())
-                            .await;
+                        let _ = osx_terminal_notifier(
+                            "番茄钟：当前阶段结束！",
+                            "",
+                            notify_sound.clone(),
+                        )
+                        .await;
                         let pomodoro_lock = pomodoro.lock().await;
                         println!(
                             "已完成的工作周期: {}",
@@ -327,7 +331,7 @@ pub async fn terminal_run(
                     /*  TODO: notify how many time need be controlled precision,not like this fixed sleep.
                     need fix it later.
                     not play any sound for now.*/
-                    osx_terminal_notifier(title, "", notify_sound.clone()).await;
+                    let _ = osx_terminal_notifier(title, "", notify_sound.clone()).await;
                     sleep(StdDuration::from_millis(500)).await;
                     format!("{}: Now is the time!", title)
                 }
