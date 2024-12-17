@@ -10,24 +10,30 @@ fn check_path_exist(path: &str) -> bool {
     }
 }
 
-pub async fn osx_terminal_notifier(title: &str, content: &str, sound: Option<String>) {
+pub async fn osx_terminal_notifier(
+    title: &str,
+    content: &str,
+    sound: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(sound_path) = sound {
         if check_path_exist(&sound_path) {
-            std::process::Command::new("terminal-notifier")
+            let mut notify_window = std::process::Command::new("terminal-notifier")
                 .args(["-message", content, "-title", title])
-                .spawn()
-                .unwrap();
-            std::process::Command::new("ffplay")
+                .spawn()?;
+            let mut sound_process = std::process::Command::new("ffplay")
                 .args(["-i", &sound_path, "-autoexit", "-nodisp"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .spawn()
-                .unwrap();
-            return;
+                .spawn()?;
+            let _ = notify_window.wait();
+            let _ = sound_process.wait();
+            return Ok(());
         }
     }
-    std::process::Command::new("terminal-notifier")
+    let mut notify_window = std::process::Command::new("terminal-notifier")
         .args(["-message", content, "-title", title, "-sound", "default"])
         .spawn()
         .unwrap();
+    let _ = notify_window.wait();
+    Ok(())
 }
