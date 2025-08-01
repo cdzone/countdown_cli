@@ -38,6 +38,17 @@ struct CliArgs {
     config_file: String,
     #[arg(short = 's', long = "notify_sound", default_value = "")]
     notify_sound: Option<String>,
+    #[arg(long = "work", help = "Set work duration in minutes")]
+    work_duration: Option<u64>,
+    #[arg(long = "short-break", help = "Set short break duration in minutes")]
+    short_break_duration: Option<u64>,
+    #[arg(long = "long-break", help = "Set long break duration in minutes")]
+    long_break_duration: Option<u64>,
+    #[arg(
+        long = "interval",
+        help = "Set long break interval (number of work sessions)"
+    )]
+    long_break_interval: Option<u32>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -60,15 +71,27 @@ struct PomodoroTimer {
 }
 
 impl PomodoroTimer {
-    fn new() -> Self {
+    fn new(cli_args: Option<&CliArgs>) -> Self {
+        // 使用命令行参数，如果没有则使用默认值
+        let work_duration = cli_args.and_then(|args| args.work_duration).unwrap_or(25);
+        let short_break_duration = cli_args
+            .and_then(|args| args.short_break_duration)
+            .unwrap_or(5);
+        let long_break_duration = cli_args
+            .and_then(|args| args.long_break_duration)
+            .unwrap_or(15);
+        let long_break_interval = cli_args
+            .and_then(|args| args.long_break_interval)
+            .unwrap_or(4);
+
         PomodoroTimer {
             start_time: None,
-            work_duration: Duration::from_secs(25 * 60),
-            short_break_duration: Duration::from_secs(5 * 60),
-            long_break_duration: Duration::from_secs(15 * 60),
+            work_duration: Duration::from_secs(work_duration * 60),
+            short_break_duration: Duration::from_secs(short_break_duration * 60),
+            long_break_duration: Duration::from_secs(long_break_duration * 60),
             state: PomodoroState::Idle,
             completed_work_sessions: 0,
-            long_break_interval: 4,
+            long_break_interval,
             last_completed_time: None,
         }
     }
@@ -138,14 +161,15 @@ impl PomodoroTimer {
 }
 
 #[allow(unused_assignments)]
-pub async fn terminal_run(
+async fn terminal_run(
     if_running: Arc<AtomicBool>,
     config: CountDownConfig,
     notify_sound: Option<String>,
+    cli_args: Option<&CliArgs>,
 ) {
     let mut stdout = stdout();
     let mut last_line_count = 0;
-    let pomodoro = Arc::new(Mutex::new(PomodoroTimer::new()));
+    let pomodoro = Arc::new(Mutex::new(PomodoroTimer::new(cli_args)));
 
     let (tx, rx) = std_mpsc::channel();
 
@@ -193,7 +217,7 @@ pub async fn terminal_run(
                 }
                 ["pause"] => paused = true,
                 ["resume"] => paused = false,
-                _ => println!("未知命令: {}", command),
+                _ => println!("未知命令: {command}"),
             }
             drop(pomodoro_lock);
         }
@@ -333,7 +357,7 @@ pub async fn terminal_run(
                     not play any sound for now.*/
                     let _ = osx_terminal_notifier(title, "", notify_sound.clone()).await;
                     sleep(StdDuration::from_millis(500)).await;
-                    format!("{}: Now is the time!", title)
+                    format!("{title}: Now is the time!")
                 }
                 i64::MIN..=-1_i64 => {
                     format!(
@@ -343,7 +367,7 @@ pub async fn terminal_run(
                 }
             };
 
-            println!("{}", message);
+            println!("{message}");
             current_line_count += 1;
             stdout.flush().unwrap();
         }
@@ -392,8 +416,8 @@ fn print_help() {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli_args = CliArgs::parse();
-    let file_path = cli_args.config_file;
-    let notify_sound = cli_args.notify_sound;
+    let file_path = cli_args.config_file.clone();
+    let notify_sound = cli_args.notify_sound.clone();
 
     let config = CountDownConfig::try_new(file_path).unwrap();
 
@@ -412,6 +436,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if_running_for_spawn,
             config_for_spawn,
             notify_sound_for_spawn,
+            Some(&cli_args),
         )
         .await
     });

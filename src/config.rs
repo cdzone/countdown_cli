@@ -34,7 +34,7 @@ impl CountDownConfig {
         let mut file = match std::fs::File::open(config_filename.clone()) {
             Ok(file) => file,
             Err(err) => {
-                println!("Error: Cannot open file '{}'", config_filename);
+                println!("Error: Cannot open file '{config_filename}'");
                 return Err(err.into());
             }
         };
