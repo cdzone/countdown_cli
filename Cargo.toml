@@ -1,6 +1,6 @@
 [package]
 name = "countdown_cli"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 
 [profile.release]
@@ -9,12 +9,12 @@ lto = "thin"
 [dependencies]
 chrono = "0.4"
 tokio = { version = "1", features = ["full"] }
-ctrlc = "3.1.9"
-crossterm = "0.28.1"
-toml = "0.8.19"
-serde = "1.0.130"
-serde_derive = "1.0.130"
-colored = "2"
+ctrlc = "3"
+crossterm = "0.29"
+toml = "0.9"
+serde = "1"
+serde_derive = "1"
+colored = "3"
 clap = { version = "4", features = ["derive"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
