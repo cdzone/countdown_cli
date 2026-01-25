@@ -1,7 +1,7 @@
 use chrono::{Local, NaiveDateTime};
 use clap::Parser;
 use colored::*;
-use config::{CountDownConfig, HotReload};
+use config::{calculate_target_time, CountDownConfig, HotReload};
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{cursor, ExecutableCommand};
 use notify::osx_terminal_notifier;
@@ -14,7 +14,6 @@ use std::time::{Duration as StdDuration, Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 
-mod command;
 mod config;
 mod notify;
 
@@ -227,6 +226,7 @@ async fn terminal_run(
             continue;
         }
 
+        let now = Local::now().naive_local();
         let mut target_datetimes: Vec<(String, NaiveDateTime)> = config
             .get_config()
             .await
@@ -234,9 +234,9 @@ async fn terminal_run(
             .into_iter()
             .filter(|countdown| countdown.enabled)
             .filter_map(|countdown| {
-                match NaiveDateTime::parse_from_str(&countdown.datetime, "%Y-%m-%d %H:%M:%S") {
-                    Ok(datetime) => Some((countdown.title.clone(), datetime)),
-                    Err(_) => {
+                match calculate_target_time(&countdown.datetime, countdown.repeat.as_ref(), now) {
+                    Some(datetime) => Some((countdown.title.clone(), datetime)),
+                    None => {
                         println!(
                             "错误：'{}' 的日期时间格式无效。请使用 'YYYY-MM-DD HH:MM:SS' 格式。",
                             countdown.title
@@ -318,7 +318,6 @@ async fn terminal_run(
         drop(pomodoro_lock);
 
         for (title, target_datetime) in target_datetimes.iter() {
-            let now = Local::now().naive_local();
             let remaining = *target_datetime - now;
             let remaining_seconds = remaining.num_seconds();
 
