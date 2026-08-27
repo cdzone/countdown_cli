@@ -5,14 +5,14 @@ use config::{calculate_target_time, CountDownConfig, HotReload};
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{cursor, ExecutableCommand};
 use notify::osx_terminal_notifier;
+use std::collections::HashSet;
 use std::io::{stdout, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration as StdDuration, Duration, Instant};
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use tokio::time::sleep;
 
 mod config;
 mod notify;
@@ -35,7 +35,7 @@ struct CliArgs {
         default_value = "config.toml"
     )]
     config_file: String,
-    #[arg(short = 's', long = "notify_sound", default_value = "")]
+    #[arg(short = 's', long = "notify_sound")]
     notify_sound: Option<String>,
     #[arg(long = "work", help = "Set work duration in minutes")]
     work_duration: Option<u64>,
@@ -179,6 +179,7 @@ async fn terminal_run(
 
     let mut paused = false;
     let mut clean_without_output = false;
+    let mut notified_at_zero: HashSet<String> = HashSet::new();
 
     while if_running.load(Ordering::SeqCst) {
         if let Ok(command) = rx.try_recv() {
@@ -247,7 +248,7 @@ async fn terminal_run(
             })
             .collect();
 
-        target_datetimes.sort_by(|a, b| a.1.cmp(&b.1));
+        target_datetimes.sort_by_key(|a| a.1);
 
         // 清除之前的输出
         if !clean_without_output {
@@ -292,7 +293,7 @@ async fn terminal_run(
                         pomodoro.lock().await.next_state();
                         let _ = osx_terminal_notifier(
                             "番茄钟：当前阶段结束！",
-                            "",
+                            "当前阶段结束！",
                             notify_sound.clone(),
                         )
                         .await;
@@ -320,6 +321,9 @@ async fn terminal_run(
         for (title, target_datetime) in target_datetimes.iter() {
             let remaining = *target_datetime - now;
             let remaining_seconds = remaining.num_seconds();
+            if remaining_seconds != 0 {
+                notified_at_zero.remove(title);
+            }
 
             let message = match remaining_seconds {
                 86401_i64..=i64::MAX => {
@@ -351,11 +355,10 @@ async fn terminal_run(
                     )
                 }
                 0 => {
-                    /*  TODO: notify how many time need be controlled precision,not like this fixed sleep.
-                    need fix it later.
-                    not play any sound for now.*/
-                    let _ = osx_terminal_notifier(title, "", notify_sound.clone()).await;
-                    sleep(StdDuration::from_millis(500)).await;
+                    if notified_at_zero.insert(title.clone()) {
+                        let _ =
+                            osx_terminal_notifier(title, "时间到了", notify_sound.clone()).await;
+                    }
                     format!("{title}: Now is the time!")
                 }
                 i64::MIN..=-1_i64 => {
