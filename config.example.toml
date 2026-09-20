@@ -1,0 +1,20 @@
+# Copy to config.toml (gitignored) and edit. Do not commit real personal schedules.
+
+[[countdown]]
+title = "Example one-shot"
+datetime = "2026-12-31 18:00:00"
+
+[[countdown]]
+title = "Example daily reminder"
+datetime = "2024-01-01 09:00:00"
+repeat = "daily"
+
+[[countdown]]
+title = "Example weekday (Mon-Fri)"
+datetime = "2024-01-01 18:00:00"
+repeat = "weekday"
+
+[[countdown]]
+title = "Example disabled"
+datetime = "2024-01-01 12:00:00"
+enabled = false
