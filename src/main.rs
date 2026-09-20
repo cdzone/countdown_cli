@@ -121,15 +121,23 @@ impl PomodoroTimer {
         match self.state {
             PomodoroState::Work => {
                 self.completed_work_sessions += 1;
-                self.last_completed_time = Some(Instant::now());
+                // long_break_interval: every N completed work sessions → LongBreak, else ShortBreak.
+                let interval = self.long_break_interval.max(1);
+                if self.completed_work_sessions.is_multiple_of(interval) {
+                    self.set_state(PomodoroState::LongBreak);
+                } else {
+                    self.set_state(PomodoroState::ShortBreak);
+                }
             }
             PomodoroState::ShortBreak | PomodoroState::LongBreak => {
                 self.last_completed_time = Some(Instant::now());
+                self.state = PomodoroState::Idle;
+                self.start_time = None;
             }
-            PomodoroState::Idle => {}
+            PomodoroState::Idle => {
+                self.start_time = None;
+            }
         }
-        self.state = PomodoroState::Idle;
-        self.start_time = None;
     }
 
     fn set_state(&mut self, new_state: PomodoroState) {
@@ -303,7 +311,14 @@ async fn terminal_run(
                             pomodoro_lock.completed_work_sessions
                         );
                         current_line_count += 1;
-                        println!("请输入下一个命令（start/short/long）来开始新的阶段");
+                        match pomodoro_lock.state {
+                            PomodoroState::ShortBreak | PomodoroState::LongBreak => {
+                                println!("已自动进入下一阶段: {:?}", pomodoro_lock.state);
+                            }
+                            _ => {
+                                println!("请输入下一个命令（start/short/long）来开始新的阶段");
+                            }
+                        }
                         current_line_count += 1;
                         clean_without_output = true;
                         continue;
@@ -453,4 +468,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     countdown_handle.await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod pomodoro_interval_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn timer_with_interval(interval: u32) -> PomodoroTimer {
+        let mut t = PomodoroTimer::new(None);
+        t.set_long_break_interval(interval);
+        // Keep tests fast: 1s phases.
+        t.work_duration = Duration::from_secs(1);
+        t.short_break_duration = Duration::from_secs(1);
+        t.long_break_duration = Duration::from_secs(1);
+        t
+    }
+
+    #[test]
+    fn work_end_enters_short_break_before_interval() {
+        let mut t = timer_with_interval(4);
+        t.set_state(PomodoroState::Work);
+        t.next_state();
+        assert_eq!(t.state, PomodoroState::ShortBreak);
+        assert_eq!(t.completed_work_sessions, 1);
+        assert!(t.start_time.is_some());
+    }
+
+    #[test]
+    fn work_end_enters_long_break_on_interval() {
+        let mut t = timer_with_interval(4);
+        for _ in 0..3 {
+            t.set_state(PomodoroState::Work);
+            t.next_state();
+            assert_eq!(t.state, PomodoroState::ShortBreak);
+            t.next_state(); // break → Idle
+            assert_eq!(t.state, PomodoroState::Idle);
+        }
+        t.set_state(PomodoroState::Work);
+        t.next_state();
+        assert_eq!(t.state, PomodoroState::LongBreak);
+        assert_eq!(t.completed_work_sessions, 4);
+    }
+
+    #[test]
+    fn interval_one_always_long_break() {
+        let mut t = timer_with_interval(1);
+        t.set_state(PomodoroState::Work);
+        t.next_state();
+        assert_eq!(t.state, PomodoroState::LongBreak);
+        assert_eq!(t.completed_work_sessions, 1);
+    }
+
+    #[test]
+    fn zero_interval_treated_as_one() {
+        let mut t = timer_with_interval(0);
+        t.set_state(PomodoroState::Work);
+        t.next_state();
+        assert_eq!(t.state, PomodoroState::LongBreak);
+    }
 }
