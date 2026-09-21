@@ -66,6 +66,7 @@ pub struct CountDownData {
 pub struct CountDownConfig {
     pub data: Arc<Mutex<CountDownData>>,
     config_filename: String,
+    last_mtime: Option<std::time::SystemTime>,
 }
 
 impl CountDownConfig {
@@ -81,10 +82,25 @@ impl CountDownConfig {
         let mut contents = String::new();
         file.read_to_string(&mut contents)?;
         let countdown_data: CountDownData = toml::from_str(&contents)?;
+        let last_mtime = std::fs::metadata(&config_filename)
+            .and_then(|m| m.modified())
+            .ok();
         Ok(Self {
             data: Arc::new(Mutex::new(countdown_data)),
             config_filename,
+            last_mtime,
         })
+    }
+
+    /// Reload only when the config file mtime changed (stat, not full re-read every tick).
+    pub async fn reload_if_changed(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
+        let modified = std::fs::metadata(&self.config_filename)?.modified()?;
+        if self.last_mtime == Some(modified) {
+            return Ok(false);
+        }
+        self.reload().await?;
+        self.last_mtime = Some(modified);
+        Ok(true)
     }
 
     pub async fn set_config(&mut self, data: CountDownData) {

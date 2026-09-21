@@ -1,10 +1,10 @@
 use chrono::{Local, NaiveDateTime};
 use clap::Parser;
 use colored::*;
-use config::{calculate_target_time, CountDownConfig, HotReload};
+use config::{calculate_target_time, CountDownConfig};
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{cursor, ExecutableCommand};
-use notify::osx_terminal_notifier;
+use notify::{osx_terminal_notifier, probe_terminal_notifier};
 use std::collections::HashSet;
 use std::io::{stdout, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -457,11 +457,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await
     });
+    if let Err(msg) = probe_terminal_notifier() {
+        eprintln!("警告: {msg}");
+    }
+
     let mut config_for_reload = config.clone();
     let _reload_handle = tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            let _ = config_for_reload.reload().await;
+            // Cheap metadata check; only re-parse TOML when mtime changes.
+            let _ = config_for_reload.reload_if_changed().await;
         }
     });
 
