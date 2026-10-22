@@ -444,8 +444,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let file_path = cli_args.config_file.clone();
     let notify_sound = cli_args.notify_sound.clone();
 
-    let api_addr = cli_args.api.clone();
-    let store = CountdownStore::new(file_path, api_addr.is_some()).await?;
+    // 先校验并绑定 API 地址，再读配置：被拒的启动不能改动用户文件
+    let api_listener = match &cli_args.api {
+        Some(addr_s) => {
+            let addr: std::net::SocketAddr = addr_s
+                .parse()
+                .map_err(|_| "--api 仅接受形如 127.0.0.1:PORT 或 [::1]:PORT 的地址".to_string())?;
+            if !addr.ip().is_loopback() {
+                eprintln!("错误：--api 只允许绑定回环地址（127.0.0.1 / ::1）");
+                std::process::exit(2);
+            }
+            Some(tokio::net::TcpListener::bind(addr).await?)
+        }
+        None => None,
+    };
+    let store = CountdownStore::new(file_path, api_listener.is_some()).await?;
 
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -480,17 +493,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // 启动HTTP API（仅接受回环地址）
-    if let Some(addr_s) = api_addr {
-        let addr: std::net::SocketAddr = addr_s
-            .parse()
-            .map_err(|_| "--api 仅接受形如 127.0.0.1:PORT 或 [::1]:PORT 的地址".to_string())?;
-        if !addr.ip().is_loopback() {
-            eprintln!("错误：--api 只允许绑定回环地址（127.0.0.1 / ::1）");
-            std::process::exit(2);
-        }
-        // 构建路由并启动
+    if let Some(listener) = api_listener {
         let router = api::build_router(store.clone());
-        let listener = tokio::net::TcpListener::bind(addr).await?;
         // 不写stdout；axum默认不输出日志
         tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, router).await {
