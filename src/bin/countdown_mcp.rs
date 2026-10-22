@@ -1,12 +1,15 @@
 //! Read-only MCP server for countdown_cli.
 //!
 //! Talks to the countdown HTTP API only; it never touches the config file.
+//! Every API request carries this server's own service token (never the MCP
+//! caller's), a fresh `X-Request-Id`, and the caller id when one is known.
 
-use std::net::SocketAddr;
+use std::{fmt, net::SocketAddr, path::Path, path::PathBuf, time::Duration};
 
+use axum::http::{request::Parts, HeaderValue};
 use clap::Parser;
 use rmcp::{
-    handler::server::wrapper::Parameters,
+    handler::server::{tool::Extension, wrapper::Parameters},
     model::*,
     schemars, tool, tool_handler, tool_router,
     transport::streamable_http_server::{
@@ -15,6 +18,11 @@ use rmcp::{
     ErrorData as McpError, ServerHandler,
 };
 use serde::{Deserialize, Serialize};
+
+const X_REQUEST_ID: &str = "x-request-id";
+const X_COUNTDOWN_CALLER: &str = "x-countdown-caller";
+/// Bounds the startup probe so a hung API cannot stall startup.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -32,6 +40,164 @@ struct Args {
     /// Address to serve MCP on (loopback only)
     #[arg(long, env = "COUNTDOWN_MCP_ADDR", default_value = "127.0.0.1:8765")]
     addr: SocketAddr,
+    /// File holding the plaintext bearer token presented to the API
+    /// (one line; on Unix it must not be readable by group or others)
+    #[arg(long, env = "COUNTDOWN_API_TOKEN_FILE")]
+    api_token_file: PathBuf,
+}
+
+/// `Authorization: Bearer <token>` for the API, marked sensitive.
+/// `Debug` is redacted so the token cannot reach a log line.
+#[derive(Clone)]
+struct ServiceToken(HeaderValue);
+
+impl fmt::Debug for ServiceToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ServiceToken(<redacted>)")
+    }
+}
+
+/// Why the token file was rejected. Messages never include file contents.
+#[derive(Debug)]
+enum TokenFileError {
+    Io(std::io::Error),
+    #[cfg_attr(not(unix), allow(dead_code))]
+    TooOpen(u32),
+    Empty,
+    InvalidChars,
+}
+
+impl fmt::Display for TokenFileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TokenFileError::Io(err) => write!(f, "cannot read: {err}"),
+            TokenFileError::TooOpen(mode) => {
+                write!(
+                    f,
+                    "mode {mode:o} gives group or others access; chmod 600 it"
+                )
+            }
+            TokenFileError::Empty => f.write_str("token is empty"),
+            TokenFileError::InvalidChars => f.write_str(
+                "token must be one line of visible ASCII with no spaces \
+                 (only a final \\n or \\r\\n is stripped)",
+            ),
+        }
+    }
+}
+
+impl ServiceToken {
+    fn load(path: &Path) -> Result<Self, TokenFileError> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path).map_err(TokenFileError::Io)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = file
+                .metadata()
+                .map_err(TokenFileError::Io)?
+                .permissions()
+                .mode()
+                & 0o777;
+            if mode & 0o077 != 0 {
+                return Err(TokenFileError::TooOpen(mode));
+            }
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(TokenFileError::Io)?;
+        Self::parse(&bytes)
+    }
+
+    /// Strips exactly one trailing `\n` or `\r\n`; anything else that is not
+    /// visible ASCII is rejected rather than trimmed.
+    fn parse(bytes: &[u8]) -> Result<Self, TokenFileError> {
+        let token = match bytes.strip_suffix(b"\n") {
+            Some(line) => line.strip_suffix(b"\r").unwrap_or(line),
+            None => bytes,
+        };
+        if token.is_empty() {
+            return Err(TokenFileError::Empty);
+        }
+        if !token.iter().all(u8::is_ascii_graphic) {
+            return Err(TokenFileError::InvalidChars);
+        }
+        let mut value = HeaderValue::from_bytes(&[b"Bearer ", token].concat())
+            .expect("visible ASCII is a valid header value");
+        value.set_sensitive(true);
+        Ok(ServiceToken(value))
+    }
+}
+
+/// Id of the authenticated MCP caller. The `/mcp` entry middleware puts it
+/// into the request extensions; until that exists no caller is forwarded.
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // only tests construct it until the middleware lands
+struct Caller(String);
+
+#[derive(Serialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+enum Outcome {
+    UpstreamAuthFailed,
+    UpstreamUnreachable,
+    Error,
+}
+
+/// One upstream request, correlated with the API side by `request_id`.
+struct Upstream {
+    request_id: String,
+    caller: Option<String>,
+    action: &'static str,
+    target: Option<String>,
+}
+
+impl Upstream {
+    fn new(action: &'static str, parts: Option<&Parts>, target: Option<&str>) -> Self {
+        Self {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            caller: parts
+                .and_then(|p| p.extensions.get::<Caller>())
+                .map(|c| c.0.clone()),
+            action,
+            target: target.map(str::to_owned),
+        }
+    }
+
+    /// One JSON line on stderr, same shape as the audit records.
+    fn report(&self, outcome: Outcome, upstream_status: Option<reqwest::StatusCode>) {
+        #[derive(Serialize)]
+        struct Line<'a> {
+            ts: String,
+            svc: &'static str,
+            request_id: &'a str,
+            caller: Option<&'a str>,
+            action: &'a str,
+            target: Option<&'a str>,
+            outcome: Outcome,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            upstream_status: Option<u16>,
+        }
+        let line = Line {
+            ts: chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, false),
+            svc: "mcp",
+            request_id: &self.request_id,
+            caller: self.caller.as_deref(),
+            action: self.action,
+            target: self.target.as_deref(),
+            outcome,
+            upstream_status: upstream_status.map(|s| s.as_u16()),
+        };
+        eprintln!(
+            "{}",
+            serde_json::to_string(&line).expect("log line serializes")
+        );
+    }
+}
+
+fn rejected_credential(status: reqwest::StatusCode) -> String {
+    format!(
+        "countdown API rejected the MCP service credential (HTTP {})",
+        status.as_u16()
+    )
 }
 
 /// Fields of the API's countdown object that the tools expose.
@@ -81,15 +247,25 @@ fn due_within(c: &Countdown, hours: u32) -> bool {
     matches!(c.remaining_seconds, Some(s) if (0..=limit).contains(&s))
 }
 
+/// Result of the startup probe that `main` has to act on.
+#[derive(Debug, PartialEq)]
+enum Probe {
+    Accepted,
+    Rejected(reqwest::StatusCode),
+}
+
 #[tool_router]
 impl CountdownMcp {
-    fn new(api_url: reqwest::Url) -> Self {
+    fn new(api_url: reqwest::Url, token: &ServiceToken) -> Self {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::AUTHORIZATION, token.0.clone());
         Self {
             api_url,
             // The API is local; ignore HTTP_PROXY and friends so a proxy
             // configured for the shell cannot make it look unreachable.
             http: reqwest::Client::builder()
                 .no_proxy()
+                .default_headers(headers)
                 .build()
                 .expect("build HTTP client"),
         }
@@ -105,16 +281,36 @@ impl CountdownMcp {
         url
     }
 
-    async fn fetch<T: for<'de> Deserialize<'de>>(&self, url: reqwest::Url) -> Result<T, String> {
-        let resp = self
-            .http
-            .get(url.clone())
-            .send()
-            .await
-            .map_err(|e| format!("countdown API unreachable at {url}: {e}"))?;
+    fn get(&self, url: reqwest::Url, up: &Upstream) -> reqwest::RequestBuilder {
+        let mut req = self.http.get(url).header(X_REQUEST_ID, &up.request_id);
+        if let Some(caller) = up.caller.as_deref() {
+            if let Ok(value) = HeaderValue::from_str(caller) {
+                req = req.header(X_COUNTDOWN_CALLER, value);
+            }
+        }
+        req
+    }
+
+    async fn fetch<T: for<'de> Deserialize<'de>>(
+        &self,
+        url: reqwest::Url,
+        up: &Upstream,
+    ) -> Result<T, String> {
+        let resp = self.get(url.clone(), up).send().await.map_err(|e| {
+            up.report(Outcome::UpstreamUnreachable, None);
+            format!("countdown API unreachable at {url}: {e}")
+        })?;
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_FOUND {
             return Err("countdown not found".to_string());
+        }
+        // The API's body is not passed on: it is not meant for the model.
+        if matches!(
+            status,
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            up.report(Outcome::UpstreamAuthFailed, Some(status));
+            return Err(rejected_credential(status));
         }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -125,18 +321,46 @@ impl CountdownMcp {
             .map_err(|e| format!("countdown API returned an unexpected body: {e}"))
     }
 
+    /// Checks the service token once at startup. An unreachable API is only
+    /// reported, since it may start after this server.
+    async fn probe(&self) -> Probe {
+        let up = Upstream::new("probe:GET /countdowns", None, None);
+        let mut url = self.endpoint(&["countdowns"]);
+        url.query_pairs_mut().append_pair("enabled", "true");
+        let status = match self.get(url, &up).timeout(PROBE_TIMEOUT).send().await {
+            Ok(resp) => resp.status(),
+            Err(_) => {
+                up.report(Outcome::UpstreamUnreachable, None);
+                return Probe::Accepted;
+            }
+        };
+        match status {
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+                up.report(Outcome::UpstreamAuthFailed, Some(status));
+                Probe::Rejected(status)
+            }
+            s if !s.is_success() => {
+                up.report(Outcome::Error, Some(s));
+                Probe::Accepted
+            }
+            _ => Probe::Accepted,
+        }
+    }
+
     #[tool(
         description = "List countdowns sorted by target time. Returns id, title, target_time, remaining_seconds, repeat, enabled."
     )]
     async fn list_countdowns(
         &self,
         Parameters(args): Parameters<ListArgs>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
+        let up = Upstream::new("tool:list_countdowns", Some(&parts), None);
         let mut url = self.endpoint(&["countdowns"]);
         if !args.include_disabled {
             url.query_pairs_mut().append_pair("enabled", "true");
         }
-        let items: Vec<Countdown> = match self.fetch(url).await {
+        let items: Vec<Countdown> = match self.fetch(url, &up).await {
             Ok(items) => items,
             Err(msg) => return Ok(tool_error(msg)),
         };
@@ -153,9 +377,11 @@ impl CountdownMcp {
     async fn get_countdown(
         &self,
         Parameters(GetArgs { id }): Parameters<GetArgs>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
+        let up = Upstream::new("tool:get_countdown", Some(&parts), Some(&id));
         match self
-            .fetch::<Countdown>(self.endpoint(&["countdowns", &id]))
+            .fetch::<Countdown>(self.endpoint(&["countdowns", &id]), &up)
             .await
         {
             Ok(item) => json_result(&item),
@@ -185,9 +411,20 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let api_url = args.api_url;
+    let token = match ServiceToken::load(&args.api_token_file) {
+        Ok(token) => token,
+        Err(e) => {
+            eprintln!("--api-token-file {}: {e}", args.api_token_file.display());
+            std::process::exit(2);
+        }
+    };
+    let mcp = CountdownMcp::new(args.api_url, &token);
+    if let Probe::Rejected(status) = mcp.probe().await {
+        eprintln!("{}; check --api-token-file", rejected_credential(status));
+        std::process::exit(2);
+    }
     let service = StreamableHttpService::new(
-        move || Ok(CountdownMcp::new(api_url.clone())),
+        move || Ok(mcp.clone()),
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default(),
     );
@@ -202,6 +439,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderMap;
     use axum::{
         extract::{Path, Query},
         http::StatusCode,
@@ -211,6 +449,7 @@ mod tests {
     };
     use serde_json::{json, Value};
     use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
 
     fn item(id: &str, remaining: Option<i64>, enabled: bool) -> Value {
         json!({
@@ -290,34 +529,54 @@ mod tests {
         })
     }
 
+    fn get_args(id: &str) -> Parameters<GetArgs> {
+        Parameters(GetArgs { id: id.into() })
+    }
+
+    const SERVICE_TOKEN: &str = "svc-token-0123456789abcdef0123456789abcdef";
+
+    fn mcp(api_url: reqwest::Url) -> CountdownMcp {
+        CountdownMcp::new(
+            api_url,
+            &ServiceToken::parse(SERVICE_TOKEN.as_bytes()).unwrap(),
+        )
+    }
+
+    /// Request parts as rmcp hands them to a tool, optionally with a caller.
+    fn parts(caller: Option<&str>) -> Extension<Parts> {
+        let (mut parts, ()) = axum::http::Request::new(()).into_parts();
+        if let Some(c) = caller {
+            parts.extensions.insert(Caller(c.to_owned()));
+        }
+        Extension(parts)
+    }
+
+    fn anon() -> Extension<Parts> {
+        parts(None)
+    }
+
     #[tokio::test]
     async fn unreachable_api_is_tool_error_not_protocol_error() {
-        let mcp = CountdownMcp::new(unreachable_url().await);
-        let r = mcp.list_countdowns(list(None, false)).await.unwrap();
-        assert_eq!(r.is_error, Some(true));
-        assert!(text(&r).contains("unreachable"), "{}", text(&r));
+        let mcp = mcp(unreachable_url().await);
         let r = mcp
-            .get_countdown(Parameters(GetArgs { id: "x".into() }))
+            .list_countdowns(list(None, false), anon())
             .await
             .unwrap();
+        assert_eq!(r.is_error, Some(true));
+        assert!(text(&r).contains("unreachable"), "{}", text(&r));
+        let r = mcp.get_countdown(get_args("x"), anon()).await.unwrap();
         assert_eq!(r.is_error, Some(true));
         assert!(text(&r).contains("unreachable"), "{}", text(&r));
     }
 
     #[tokio::test]
     async fn get_missing_is_tool_error_and_existing_succeeds() {
-        let mcp = CountdownMcp::new(stub_api().await);
-        let r = mcp
-            .get_countdown(Parameters(GetArgs { id: "nope".into() }))
-            .await
-            .unwrap();
+        let mcp = mcp(stub_api().await);
+        let r = mcp.get_countdown(get_args("nope"), anon()).await.unwrap();
         assert_eq!(r.is_error, Some(true));
         assert!(text(&r).contains("not found"), "{}", text(&r));
 
-        let r = mcp
-            .get_countdown(Parameters(GetArgs { id: "edge".into() }))
-            .await
-            .unwrap();
+        let r = mcp.get_countdown(get_args("edge"), anon()).await.unwrap();
         assert_eq!(r.is_error, Some(false));
         let c: Countdown = serde_json::from_str(&text(&r)).unwrap();
         assert_eq!(c.remaining_seconds, Some(3600));
@@ -325,11 +584,9 @@ mod tests {
 
     #[tokio::test]
     async fn id_cannot_escape_the_countdown_path() {
-        let mcp = CountdownMcp::new(stub_api().await);
+        let mcp = mcp(stub_api().await);
         let r = mcp
-            .get_countdown(Parameters(GetArgs {
-                id: "../countdowns".into(),
-            }))
+            .get_countdown(get_args("../countdowns"), anon())
             .await
             .unwrap();
         assert_eq!(r.is_error, Some(true));
@@ -338,17 +595,23 @@ mod tests {
 
     #[tokio::test]
     async fn list_hides_disabled_by_default() {
-        let mcp = CountdownMcp::new(stub_api().await);
-        let r = mcp.list_countdowns(list(None, false)).await.unwrap();
+        let mcp = mcp(stub_api().await);
+        let r = mcp
+            .list_countdowns(list(None, false), anon())
+            .await
+            .unwrap();
         assert!(!ids(&r).contains(&"off".to_string()));
-        let r = mcp.list_countdowns(list(None, true)).await.unwrap();
+        let r = mcp.list_countdowns(list(None, true), anon()).await.unwrap();
         assert!(ids(&r).contains(&"off".to_string()));
     }
 
     #[tokio::test]
     async fn within_hours_keeps_zero_to_limit_inclusive() {
-        let mcp = CountdownMcp::new(stub_api().await);
-        let r = mcp.list_countdowns(list(Some(1), false)).await.unwrap();
+        let mcp = mcp(stub_api().await);
+        let r = mcp
+            .list_countdowns(list(Some(1), false), anon())
+            .await
+            .unwrap();
         assert_eq!(ids(&r), vec!["now", "edge"]);
     }
 
@@ -357,5 +620,190 @@ mod tests {
         let a: ListArgs = serde_json::from_value(json!({})).unwrap();
         assert!(!a.include_disabled);
         assert_eq!(a.within_hours, None);
+    }
+
+    /// API stub that answers every request with `status` and `body`, and
+    /// records the headers of each request it receives.
+    async fn recording_api(
+        status: StatusCode,
+        body: &'static str,
+    ) -> (reqwest::Url, Arc<Mutex<Vec<HeaderMap>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new().fallback({
+            let seen = seen.clone();
+            move |headers: HeaderMap| {
+                seen.lock().unwrap().push(headers);
+                async move { (status, [("content-type", "application/json")], body) }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}").parse().unwrap(), seen)
+    }
+
+    const SECRET_BODY: &str = r#"{"error":{"code":"unauthorized","message":"BODY-MARKER-7f3a"}}"#;
+
+    #[tokio::test]
+    async fn every_api_request_carries_the_service_token() {
+        let (url, seen) = recording_api(StatusCode::OK, "[]").await;
+        let mcp = mcp(url);
+        mcp.list_countdowns(list(None, false), anon())
+            .await
+            .unwrap();
+        mcp.get_countdown(get_args("a"), anon()).await.unwrap();
+        assert_eq!(mcp.probe().await, Probe::Accepted);
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        for h in seen.iter() {
+            assert_eq!(
+                h.get("authorization").unwrap(),
+                &format!("Bearer {SERVICE_TOKEN}")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn each_call_gets_a_fresh_request_id_and_forwards_the_caller() {
+        let (url, seen) = recording_api(StatusCode::OK, "[]").await;
+        let mcp = mcp(url);
+        mcp.list_countdowns(list(None, false), parts(Some("agent-dev")))
+            .await
+            .unwrap();
+        mcp.list_countdowns(list(None, false), anon())
+            .await
+            .unwrap();
+
+        let seen = seen.lock().unwrap();
+        let ids: Vec<uuid::Uuid> = seen
+            .iter()
+            .map(|h| h[X_REQUEST_ID].to_str().unwrap().parse().unwrap())
+            .collect();
+        assert_ne!(ids[0], ids[1]);
+        assert!(ids.iter().all(|id| id.get_version_num() == 4));
+        assert_eq!(seen[0][X_COUNTDOWN_CALLER], "agent-dev");
+        assert!(seen[1].get(X_COUNTDOWN_CALLER).is_none());
+    }
+
+    #[tokio::test]
+    async fn rejected_credential_is_fixed_text_without_api_body() {
+        for (status, code) in [
+            (StatusCode::UNAUTHORIZED, 401),
+            (StatusCode::FORBIDDEN, 403),
+        ] {
+            let (url, _) = recording_api(status, SECRET_BODY).await;
+            let mcp = mcp(url);
+            let expected =
+                format!("countdown API rejected the MCP service credential (HTTP {code})");
+
+            let r = mcp
+                .list_countdowns(list(None, false), anon())
+                .await
+                .unwrap();
+            assert_eq!(r.is_error, Some(true));
+            assert_eq!(text(&r), expected);
+
+            let r = mcp.get_countdown(get_args("a"), anon()).await.unwrap();
+            assert_eq!(r.is_error, Some(true));
+            assert!(text(&r).starts_with(&expected), "{}", text(&r));
+            assert!(!text(&r).contains("BODY-MARKER"), "{}", text(&r));
+        }
+    }
+
+    #[tokio::test]
+    async fn other_api_errors_still_pass_the_body_through() {
+        let (url, _) = recording_api(StatusCode::INTERNAL_SERVER_ERROR, SECRET_BODY).await;
+        let r = mcp(url)
+            .list_countdowns(list(None, false), anon())
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true));
+        assert!(text(&r).contains("BODY-MARKER"), "{}", text(&r));
+    }
+
+    #[tokio::test]
+    async fn probe_fails_only_on_rejected_credential() {
+        for (status, expected) in [
+            (StatusCode::OK, Probe::Accepted),
+            (StatusCode::INTERNAL_SERVER_ERROR, Probe::Accepted),
+            (
+                StatusCode::UNAUTHORIZED,
+                Probe::Rejected(StatusCode::UNAUTHORIZED),
+            ),
+            (
+                StatusCode::FORBIDDEN,
+                Probe::Rejected(StatusCode::FORBIDDEN),
+            ),
+        ] {
+            let (url, _) = recording_api(status, SECRET_BODY).await;
+            assert_eq!(mcp(url).probe().await, expected, "{status}");
+        }
+        assert_eq!(mcp(unreachable_url().await).probe().await, Probe::Accepted);
+    }
+
+    fn header_of(bytes: &[u8]) -> HeaderValue {
+        ServiceToken::parse(bytes).unwrap().0
+    }
+
+    #[test]
+    fn token_file_trailing_newline_is_stripped_once() {
+        let plain = header_of(SERVICE_TOKEN.as_bytes());
+        assert_eq!(plain, format!("Bearer {SERVICE_TOKEN}"));
+        for suffix in ["\n", "\r\n"] {
+            let raw = format!("{SERVICE_TOKEN}{suffix}");
+            assert_eq!(header_of(raw.as_bytes()), plain, "{suffix:?}");
+        }
+        assert!(plain.is_sensitive());
+    }
+
+    #[test]
+    fn token_file_rejects_empty_and_non_token_content() {
+        for raw in ["", "\n", "\r\n"] {
+            assert!(
+                matches!(
+                    ServiceToken::parse(raw.as_bytes()),
+                    Err(TokenFileError::Empty)
+                ),
+                "{raw:?}"
+            );
+        }
+        for raw in [
+            "abc def", "abc\tdef", "abc\n\n", "abc\ndef", "abc\r", " abc", "abc \n", "tök",
+        ] {
+            let err = ServiceToken::parse(raw.as_bytes()).unwrap_err();
+            assert!(matches!(err, TokenFileError::InvalidChars), "{raw:?}");
+            assert!(!err.to_string().contains("abc"), "{err}");
+        }
+    }
+
+    #[test]
+    fn service_token_debug_is_redacted() {
+        let token = ServiceToken::parse(SERVICE_TOKEN.as_bytes()).unwrap();
+        let dump = format!("{token:?}");
+        assert!(!dump.contains(SERVICE_TOKEN), "{dump}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_file_must_not_be_group_or_world_accessible() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api.token");
+        std::fs::write(&path, format!("{SERVICE_TOKEN}\n")).unwrap();
+        for (mode, ok) in [
+            (0o600, true),
+            (0o400, true),
+            (0o640, false),
+            (0o644, false),
+            (0o604, false),
+        ] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let r = ServiceToken::load(&path);
+            assert_eq!(r.is_ok(), ok, "{mode:o}");
+            if let Err(e) = r {
+                assert!(!e.to_string().contains(SERVICE_TOKEN), "{e}");
+            }
+        }
     }
 }
