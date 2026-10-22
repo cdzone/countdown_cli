@@ -81,6 +81,10 @@ fn api_error(code: &'static str, message: impl Into<String>, status: StatusCode)
     (status, Json(body)).into_response()
 }
 
+fn internal_error<E: std::fmt::Display>(e: E) -> Response {
+    api_error("internal", e.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 #[derive(Clone)]
 pub struct ApiState {
     pub store: Arc<CountdownStore>,
@@ -194,7 +198,7 @@ async fn create_countdown(
             });
             (StatusCode::CREATED, Json(api)).into_response()
         }
-        Err(e) => api_error("invalid_body", e.to_string(), StatusCode::BAD_REQUEST),
+        Err(e) => internal_error(e),
     }
 }
 
@@ -221,9 +225,7 @@ async fn update_countdown(
         Err(CountdownUpdateError::NotFound) => {
             api_error("not_found", "Countdown not found", StatusCode::NOT_FOUND)
         }
-        Err(CountdownUpdateError::Other(e)) => {
-            api_error("invalid_body", e, StatusCode::BAD_REQUEST)
-        }
+        Err(CountdownUpdateError::Other(e)) => internal_error(e),
     }
 }
 
@@ -234,7 +236,7 @@ async fn delete_countdown(
     match state.store.api_delete(&id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => api_error("not_found", "Countdown not found", StatusCode::NOT_FOUND),
-        Err(e) => api_error("invalid_body", e.to_string(), StatusCode::BAD_REQUEST),
+        Err(e) => internal_error(e),
     }
 }
 
@@ -466,6 +468,91 @@ datetime = "2026-10-11 10:20:30"
         let list: Vec<ApiCountdown> = serde_json::from_slice(&bytes).unwrap();
         let item = list.iter().find(|it| it.title == "C").expect("new item exists");
         assert!(!item.id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_posts_produce_exact_count_and_persist() {
+        // initial file with one countdown
+        let initial = r#"
+[[countdown]]
+title = "only-one"
+datetime = "2026-12-31 00:00:00"
+"#;
+        let (router, store, _dir, path) = setup_router_with_file(initial).await;
+
+        // spawn 20 concurrent POST
+        let mut joins = Vec::new();
+        for i in 0..20 {
+            let app = router.clone();
+            let body = serde_json::json!({
+                "title": format!("n{idx}", idx=i),
+                "datetime": "2026-10-22 12:34:56",
+                "enabled": true,
+                "repeat": "daily"
+            });
+            joins.push(tokio::spawn(async move {
+                let req = Request::post("/countdowns")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap();
+                let _ = app.clone().oneshot(req).await.unwrap();
+            }));
+        }
+        for j in joins {
+            j.await.unwrap();
+        }
+
+        // read back file and memory
+        let contents = fs::read_to_string(&path).unwrap();
+        let doc = contents.parse::<toml_edit::DocumentMut>().unwrap();
+        let len_file = doc
+            .get("countdown")
+            .and_then(|it| it.as_array_of_tables())
+            .map(|arr| arr.len())
+            .unwrap_or(0);
+        let len_mem = store.read_data().await.countdown.len();
+        assert_eq!(len_file, 21, "file should have 21 items");
+        assert_eq!(len_mem, 21, "memory should have 21 items");
+    }
+
+    #[tokio::test]
+    async fn io_error_returns_500_internal() {
+        // create file and then remove write permission on dir to force IO error
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, sample_toml()).unwrap();
+        let store = CountdownStore::new(path.clone(), true).await.unwrap();
+        let router = build_router(store.clone());
+        // chmod dir to read/execute only (UNIX), after router created to force POST failure
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = fs::metadata(dir.path()).unwrap().permissions();
+            perm.set_mode(0o555);
+            fs::set_permissions(dir.path(), perm).unwrap();
+        }
+        let body = serde_json::json!({
+            "title": "will-fail",
+            "datetime": "2026-10-22 12:34:56",
+            "enabled": true
+        });
+        let res = router
+            .oneshot(
+                Request::post("/countdowns")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        #[derive(serde::Deserialize)]
+        struct E { error: Code }
+        #[derive(serde::Deserialize)]
+        struct Code { code: String }
+        let e: E = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(e.error.code, "internal");
     }
 }
 

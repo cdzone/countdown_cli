@@ -38,7 +38,6 @@ impl<'de> de::Deserialize<'de> for RepeatMode {
     }
 }
 
-#[allow(async_fn_in_trait)]
 pub(crate) trait HotReload {
     async fn reload(&mut self) -> Result<(), Box<dyn std::error::Error>>;
 }
@@ -181,6 +180,7 @@ pub fn calculate_target_time(
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tokio::sync::{RwLock, RwLockReadGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// 统一的数据与mtime存储（供终端/热加载/API共享）
 #[derive(Debug)]
@@ -189,6 +189,7 @@ pub struct CountdownStore {
     data: RwLock<CountDownData>,
     last_mtime: RwLock<Option<SystemTime>>,
     api_mode_enabled: bool,
+    write_lock: tokio::sync::Mutex<()>,
 }
 
 impl CountdownStore {
@@ -203,10 +204,12 @@ impl CountdownStore {
             data: RwLock::new(data),
             last_mtime: RwLock::new(mtime),
             api_mode_enabled,
+            write_lock: tokio::sync::Mutex::new(()),
         });
         if api_mode_enabled {
-            // 补id并落盘（只加id行，保留注释排版）
-            store.ensure_ids_and_persist_if_needed().await?;
+            // 首次启动：补id并落盘（只加id行，保留注释排版）
+            let _guard = store.write_lock.lock().await;
+            store.ensure_ids_and_persist_if_needed_locked().await?;
         }
         Ok(store)
     }
@@ -240,21 +243,25 @@ impl CountdownStore {
         Ok(true)
     }
 
+    /// 重新加载（加写锁），并在 API 模式下补 id 与落盘
     pub async fn reload(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = self.write_lock.lock().await;
+        self.reload_locked().await
+    }
+
+    async fn reload_locked(&self) -> Result<(), Box<dyn std::error::Error>> {
         let (new_data, _) = Self::load_from_file(&self.file_path)?;
         {
             let mut data_lock = self.data.write().await;
             *data_lock = new_data;
         }
         if self.api_mode_enabled {
-            self.ensure_ids_and_persist_if_needed().await?;
+            self.ensure_ids_and_persist_if_needed_locked().await?;
         }
         Ok(())
     }
 
-    async fn ensure_ids_and_persist_if_needed(
-        &self,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn ensure_ids_and_persist_if_needed_locked(&self) -> Result<(), Box<dyn std::error::Error>> {
         let mut updated = false;
         {
             let mut data = self.data.write().await;
@@ -267,12 +274,20 @@ impl CountdownStore {
         }
         if updated {
             // 用 toml_edit 给缺失id的条目加一行，并写回（写前备份 .bak）
-            self.write_back_with_id_injection().await?;
+            self.write_back_with_id_injection_locked().await?;
         }
         Ok(())
     }
 
-    async fn write_back_with_id_injection(&self) -> Result<(), Box<dyn std::error::Error>> {
+    fn unique_tmp_path(&self) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        self.file_path
+            .with_extension(format!("toml.tmp.{}.{}", pid, seq))
+    }
+
+    async fn write_back_with_id_injection_locked(&self) -> Result<(), Box<dyn std::error::Error>> {
         let original = std::fs::read_to_string(&self.file_path)?;
         let mut doc = original.parse::<toml_edit::DocumentMut>()?;
         // 备份
@@ -308,9 +323,7 @@ impl CountdownStore {
                 }
             }
         }
-        let tmp_path = self
-            .file_path
-            .with_extension("toml.tmp");
+        let tmp_path = self.unique_tmp_path();
         std::fs::write(&tmp_path, doc.to_string())?;
         std::fs::rename(&tmp_path, &self.file_path)?;
         // 更新mtime
@@ -328,7 +341,8 @@ impl CountdownStore {
         enabled: bool,
         repeat: Option<RepeatMode>,
     ) -> Result<Countdown, Box<dyn std::error::Error>> {
-        self.sync_from_disk_if_stale().await?;
+        let _guard = self.write_lock.lock().await;
+        self.sync_from_disk_if_stale_locked().await?;
         let id = uuid::Uuid::new_v4().to_string();
         // 编辑 toml 文档并落盘（保留注释）
         let original = std::fs::read_to_string(&self.file_path)?;
@@ -354,7 +368,7 @@ impl CountdownStore {
             .as_array_of_tables_mut()
             .unwrap()
             .push(new_table);
-        let tmp = self.file_path.with_extension("toml.tmp");
+        let tmp = self.unique_tmp_path();
         std::fs::write(&tmp, doc.to_string())?;
         std::fs::rename(&tmp, &self.file_path)?;
         let created = Countdown {
@@ -381,7 +395,8 @@ impl CountdownStore {
         enabled: bool,
         repeat: Option<RepeatMode>,
     ) -> Result<Countdown, CountdownUpdateError> {
-        self.sync_from_disk_if_stale()
+        let _guard = self.write_lock.lock().await;
+        self.sync_from_disk_if_stale_locked()
             .await
             .map_err(|e| CountdownUpdateError::Other(e.to_string()))?;
         let original = std::fs::read_to_string(&self.file_path)
@@ -422,7 +437,7 @@ impl CountdownStore {
         if !found {
             return Err(CountdownUpdateError::NotFound);
         }
-        let tmp = self.file_path.with_extension("toml.tmp");
+        let tmp = self.unique_tmp_path();
         std::fs::write(&tmp, doc.to_string())
             .map_err(|e| CountdownUpdateError::Other(e.to_string()))?;
         std::fs::rename(&tmp, &self.file_path)
@@ -451,7 +466,8 @@ impl CountdownStore {
     }
 
     pub async fn api_delete(&self, id: &str) -> Result<bool, Box<dyn std::error::Error>> {
-        self.sync_from_disk_if_stale().await?;
+        let _guard = self.write_lock.lock().await;
+        self.sync_from_disk_if_stale_locked().await?;
         let original = std::fs::read_to_string(&self.file_path)?;
         let mut doc = original.parse::<toml_edit::DocumentMut>()?;
         let mut deleted = false;
@@ -475,7 +491,7 @@ impl CountdownStore {
         if !deleted {
             return Ok(false);
         }
-        let tmp = self.file_path.with_extension("toml.tmp");
+        let tmp = self.unique_tmp_path();
         std::fs::write(&tmp, doc.to_string())?;
         std::fs::rename(&tmp, &self.file_path)?;
         {
@@ -487,12 +503,13 @@ impl CountdownStore {
         Ok(true)
     }
 
-    async fn sync_from_disk_if_stale(&self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn sync_from_disk_if_stale_locked(&self) -> Result<(), Box<dyn std::error::Error>> {
         let disk_mtime = std::fs::metadata(&self.file_path)?.modified()?;
         let last = self.last_mtime.read().await;
         if *last != Some(disk_mtime) {
             drop(last);
-            self.reload().await?;
+            // 已在写锁内调用
+            self.reload_locked().await?;
         }
         Ok(())
     }
