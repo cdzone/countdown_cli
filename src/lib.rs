@@ -262,21 +262,31 @@ impl CountdownStore {
         Ok(())
     }
 
+    /// 给文件里缺 id 的条目补 id：直接在 toml_edit 文档上补，
+    /// 再从补好的文档解析内存数据，内存和文件不需要再做配对。
     async fn ensure_ids_and_persist_if_needed_locked(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let original = std::fs::read_to_string(&self.file_path)?;
+        let mut doc = original.parse::<toml_edit::DocumentMut>()?;
         let mut updated = false;
-        {
-            let mut data = self.data.write().await;
-            for c in data.countdown.iter_mut() {
-                if c.id.is_none() {
-                    c.id = Some(uuid::Uuid::new_v4().to_string());
+        if let Some(arr) = doc.get_mut("countdown").and_then(|it| it.as_array_of_tables_mut()) {
+            for table in arr.iter_mut() {
+                if !table.contains_key("id") {
+                    table.insert("id", toml_edit::value(uuid::Uuid::new_v4().to_string()));
                     updated = true;
                 }
             }
         }
-        if updated {
-            // 用 toml_edit 给缺失id的条目加一行，并写回（写前备份 .bak）
-            self.write_back_with_id_injection_locked().await?;
+        if !updated {
+            return Ok(());
         }
+        let contents = doc.to_string();
+        let new_data: CountDownData = toml::from_str(&contents)?;
+        std::fs::write(self.file_path.with_extension("toml.bak"), &original)?;
+        let tmp_path = self.unique_tmp_path();
+        std::fs::write(&tmp_path, contents)?;
+        std::fs::rename(&tmp_path, &self.file_path)?;
+        *self.data.write().await = new_data;
+        *self.last_mtime.write().await = std::fs::metadata(&self.file_path)?.modified().ok();
         Ok(())
     }
 
@@ -286,52 +296,6 @@ impl CountdownStore {
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
         self.file_path
             .with_extension(format!("toml.tmp.{}.{}", pid, seq))
-    }
-
-    async fn write_back_with_id_injection_locked(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let original = std::fs::read_to_string(&self.file_path)?;
-        let mut doc = original.parse::<toml_edit::DocumentMut>()?;
-        // 备份
-        let bak_path = self.file_path.with_extension("toml.bak");
-        std::fs::write(&bak_path, &original)?;
-        if let Some(arr) = doc.get_mut("countdown").and_then(|it| it.as_array_of_tables_mut()) {
-            let data = self.data.read().await;
-            // 构建索引：按 title+datetime+repeat+enabled 粗略配对（无id文件）
-            // 为稳妥：逐条检查，如果该表没有id，则从data里找同序同值的id并填入
-            let mut idx = 0usize;
-            for table in arr.iter_mut() {
-                if !table.contains_key("id") {
-                    // 从内存数据按顺序定位对应项
-                    while idx < data.countdown.len() {
-                        let c = &data.countdown[idx];
-                        idx += 1;
-                        if let Some(id) = &c.id {
-                            // 基于字段匹配（title+datetime），尽量与原条目对应
-                            let t = table
-                                .get("title")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default();
-                            let dt = table
-                                .get("datetime")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default();
-                            if c.title == t && c.datetime == dt {
-                                table.insert("id", toml_edit::value(id.clone()));
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let tmp_path = self.unique_tmp_path();
-        std::fs::write(&tmp_path, doc.to_string())?;
-        std::fs::rename(&tmp_path, &self.file_path)?;
-        // 更新mtime
-        let modified = std::fs::metadata(&self.file_path)?.modified().ok();
-        let mut last = self.last_mtime.write().await;
-        *last = modified;
-        Ok(())
     }
 
     // --- API-side mutation helpers ---
@@ -525,6 +489,45 @@ pub enum CountdownUpdateError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn id_injection_matches_api_ids_for_duplicate_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.toml");
+        std::fs::write(
+            &path,
+            r#"[[countdown]]
+id = "x1"
+title = "A"
+datetime = "2030-01-01 00:00:00"
+
+[[countdown]]
+title = "A"
+datetime = "2030-01-01 00:00:00"
+"#,
+        )
+        .unwrap();
+
+        let store = CountdownStore::new(&path, true).await.unwrap();
+        let in_memory: Vec<String> = store
+            .read_data()
+            .await
+            .countdown
+            .iter()
+            .map(|c| c.id.clone().unwrap())
+            .collect();
+        let on_disk: CountDownData =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let on_disk: Vec<String> = on_disk
+            .countdown
+            .iter()
+            .map(|c| c.id.clone().unwrap())
+            .collect();
+
+        assert_eq!(in_memory, on_disk);
+        assert_eq!(on_disk[0], "x1");
+        assert_ne!(on_disk[0], on_disk[1]);
+    }
 
     #[test]
     fn test_repeat_mode_deserialize_daily() {
