@@ -260,6 +260,76 @@ impl std::error::Error for TokenTableError {
     }
 }
 
+/// Why a token file was rejected. Messages never include file contents.
+#[derive(Debug)]
+pub enum TokenFileError {
+    Io(io::Error),
+    TooOpen(u32),
+    Empty,
+    InvalidChars,
+}
+
+impl fmt::Display for TokenFileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TokenFileError::Io(err) => write!(f, "cannot read: {err}"),
+            TokenFileError::TooOpen(mode) => {
+                write!(
+                    f,
+                    "mode {mode:o} gives group or others access; chmod 600 it"
+                )
+            }
+            TokenFileError::Empty => f.write_str("token is empty"),
+            TokenFileError::InvalidChars => f.write_str(
+                "token must be one line of visible ASCII with no spaces \
+                 (only a final \\n or \\r\\n is stripped)",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TokenFileError {}
+
+/// Reads a file holding one plaintext bearer token, as presented by a client
+/// (the MCP server to the API, the agent to the MCP server). On Unix the file
+/// must not be readable by group or others.
+pub fn read_token_file(path: &Path) -> Result<String, TokenFileError> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(TokenFileError::Io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = file
+            .metadata()
+            .map_err(TokenFileError::Io)?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(TokenFileError::TooOpen(mode));
+        }
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(TokenFileError::Io)?;
+    parse_token_file(&bytes)
+}
+
+/// Strips exactly one trailing `\n` or `\r\n`; anything else that is not
+/// visible ASCII is rejected rather than trimmed.
+pub fn parse_token_file(bytes: &[u8]) -> Result<String, TokenFileError> {
+    let token = match bytes.strip_suffix(b"\n") {
+        Some(line) => line.strip_suffix(b"\r").unwrap_or(line),
+        None => bytes,
+    };
+    if token.is_empty() {
+        return Err(TokenFileError::Empty);
+    }
+    if !token.iter().all(u8::is_ascii_graphic) {
+        return Err(TokenFileError::InvalidChars);
+    }
+    Ok(String::from_utf8(token.to_vec()).expect("visible ASCII is UTF-8"))
+}
+
 /// `WWW-Authenticate` value for a 401, shared by the API and MCP so both
 /// challenge the same way. `invalid_token` is set when a bearer token was
 /// presented (empty or unknown); `scope` hints what a caller should ask for.

@@ -22,7 +22,7 @@ use axum::{
 use clap::Parser;
 use countdown_cli::{
     audit::{truncated, AuditLog},
-    auth::{bearer_challenge, TokenTable},
+    auth::{bearer_challenge, read_token_file, TokenFileError, TokenTable},
 };
 use rmcp::{
     handler::server::{tool::Extension, wrapper::Parameters},
@@ -83,74 +83,21 @@ impl fmt::Debug for ServiceToken {
     }
 }
 
-/// Why the token file was rejected. Messages never include file contents.
-#[derive(Debug)]
-enum TokenFileError {
-    Io(std::io::Error),
-    #[cfg_attr(not(unix), allow(dead_code))]
-    TooOpen(u32),
-    Empty,
-    InvalidChars,
-}
-
-impl fmt::Display for TokenFileError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TokenFileError::Io(err) => write!(f, "cannot read: {err}"),
-            TokenFileError::TooOpen(mode) => {
-                write!(
-                    f,
-                    "mode {mode:o} gives group or others access; chmod 600 it"
-                )
-            }
-            TokenFileError::Empty => f.write_str("token is empty"),
-            TokenFileError::InvalidChars => f.write_str(
-                "token must be one line of visible ASCII with no spaces \
-                 (only a final \\n or \\r\\n is stripped)",
-            ),
-        }
-    }
-}
-
 impl ServiceToken {
     fn load(path: &Path) -> Result<Self, TokenFileError> {
-        use std::io::Read;
-        let mut file = std::fs::File::open(path).map_err(TokenFileError::Io)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = file
-                .metadata()
-                .map_err(TokenFileError::Io)?
-                .permissions()
-                .mode()
-                & 0o777;
-            if mode & 0o077 != 0 {
-                return Err(TokenFileError::TooOpen(mode));
-            }
-        }
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).map_err(TokenFileError::Io)?;
-        Self::parse(&bytes)
+        read_token_file(path).map(Self::from_plain)
     }
 
-    /// Strips exactly one trailing `\n` or `\r\n`; anything else that is not
-    /// visible ASCII is rejected rather than trimmed.
+    #[cfg(test)]
     fn parse(bytes: &[u8]) -> Result<Self, TokenFileError> {
-        let token = match bytes.strip_suffix(b"\n") {
-            Some(line) => line.strip_suffix(b"\r").unwrap_or(line),
-            None => bytes,
-        };
-        if token.is_empty() {
-            return Err(TokenFileError::Empty);
-        }
-        if !token.iter().all(u8::is_ascii_graphic) {
-            return Err(TokenFileError::InvalidChars);
-        }
-        let mut value = HeaderValue::from_bytes(&[b"Bearer ", token].concat())
+        countdown_cli::auth::parse_token_file(bytes).map(Self::from_plain)
+    }
+
+    fn from_plain(token: String) -> Self {
+        let mut value = HeaderValue::from_str(&format!("Bearer {token}"))
             .expect("visible ASCII is a valid header value");
         value.set_sensitive(true);
-        Ok(ServiceToken(value))
+        ServiceToken(value)
     }
 
     /// The bare token, for the audience check against the entry table.

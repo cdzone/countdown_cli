@@ -408,14 +408,25 @@ async fn oversized_write_body_is_413_and_not_executed() {
         .bearer_auth(ADMIN_TOKEN)
         .json(&serde_json::json!({"title": title, "datetime": "2030-01-01 00:00:00"}))
         .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 413);
-    let body: Value = res.json().await.unwrap();
-    assert_eq!(body["error"]["code"], "payload_too_large");
+        .await;
+    match res {
+        Ok(res) => {
+            assert_eq!(res.status(), 413);
+            let body: Value = res.json().await.unwrap();
+            assert_eq!(body["error"]["code"], "payload_too_large");
+        }
+        // The server may reply 413 and close while we still upload.
+        Err(e) => assert!(!e.is_timeout(), "unexpected error: {e:?}"),
+    }
     assert_eq!(std::fs::read(&config).unwrap(), before, "write executed");
 
-    let new: Vec<Value> = audit_lines(&audit).split_off(before_lines);
+    // The audit line may land after the client sees the reset.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut new: Vec<Value> = audit_lines(&audit).split_off(before_lines);
+    while !new.iter().any(|l| l["status"] == 413) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        new = audit_lines(&audit).split_off(before_lines);
+    }
     assert!(new.iter().all(|l| l["phase"] != "attempt"), "{new:?}");
     let result: Vec<&Value> = new.iter().filter(|l| l["status"] == 413).collect();
     assert_eq!(result.len(), 1, "{new:?}");
