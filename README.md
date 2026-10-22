@@ -1,6 +1,6 @@
 # countdown_cli
 
-终端倒计时 / 番茄钟小工具，可选开一个只听回环地址的 HTTP API（`--api`），另带一个只读的 MCP 服务 `countdown_mcp`，把 API 里的提醒暴露给 MCP 客户端；还带一个命令行智能体 `countdown_agent`，用本机模型通过 MCP 回答倒计时问题（第 11 节）。
+终端倒计时 / 番茄钟小工具，可选开一个只听回环地址的 HTTP API（`--api`），另带一个只读的 MCP 服务 `countdown_mcp`，把 API 里的提醒暴露给 MCP 客户端；还带一个命令行智能体 `countdown_agent`，用本机模型通过 MCP 回答倒计时问题（第 11 节），并可开一个 AG-UI 接口和本地对话页面（第 12 节）。
 
 本文只写鉴权、审计和部署相关的用法。完整参数以 `countdown_cli --help`、`countdown_mcp --help` 为准。
 
@@ -331,3 +331,73 @@ countdown_agent                          # 不带参数：一行一个问题，C
 - 不流式输出，回答要等模型整段生成完；推理模型会比较慢。
 - 只接 OpenAI Chat Completions 格式的 `tool_calls`；较老的 Ollama（< v0.12.11）可能漏掉 `tool_call_id`，会导致解析失败，所以要求 ≥ v0.32.6。
 - `async-openai` 的 `OpenAIConfig::new()` 内部仍会读一次 `OPENAI_*` 环境变量，读到的值随即被显式设置覆盖，不会被发出（有测试断言）。
+
+## 12. AG-UI 接口与对话页面（`countdown_agent --serve`）
+
+```
+浏览器页面 / 任何 AG-UI 客户端 ──POST /agui（SSE）──▶ countdown_agent --serve ──▶ 模型网关、countdown_mcp（同第 11 节）
+```
+
+**任何 AG-UI 客户端都能接这个接口**：`POST /agui` 收 AG-UI 的 `RunAgentInput`，按 AG-UI 协议以 SSE 返回事件。本仓库的网页只是其中一种客户端，只做展示；调不调工具、「查不到」、去掉思考内容都在智能体里完成，接口不依赖网页，页面文件缺失时接口照常可用。
+
+### 12.1 启动
+
+```sh
+export COUNTDOWN_AGENT_MODEL=deepseek-r1:8b
+export COUNTDOWN_AGENT_MCP_TOKEN_FILE=$PWD/agent.token
+countdown_agent --serve                    # 默认 127.0.0.1:8780
+countdown_agent --serve 127.0.0.1:9000     # 只接受 127.0.0.1，其他地址退出码 2
+```
+
+环境变量同 11.2，另加：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `COUNTDOWN_AGENT_WEB_DIR` | 可执行文件所在目录下的 `web/dist` | 页面文件目录，启动时解析一次，不看当前工作目录 |
+
+启动成功在 stderr 打一行 `{"level":"info","svc":"agent","event":"listening","addr":"127.0.0.1:8780"}`。页面目录不存在时另打一行 `{"level":"warn","svc":"agent","event":"web_dir_missing","web_dir":"…","reason":"先构建前端…或设置 COUNTDOWN_AGENT_WEB_DIR"}`，服务照常启动。
+
+### 12.2 路由
+
+| 路由 | 说明 |
+|---|---|
+| `POST /agui` | AG-UI 接口，`text/event-stream` |
+| `GET /` | 页面 `index.html` |
+| `GET /app.js` | 页面脚本（打包后的单个文件） |
+
+页面和接口同一个端口。页面文件缺失时 `/`、`/app.js` 返回 503，正文写明缺失的路径；`/agui` 不受影响。
+
+### 12.3 访问控制
+
+- 所有路由先查 `Host`：只接受 `127.0.0.1:<端口>`、`localhost:<端口>`（端口为实际监听端口），缺 `Host` 或其他值一律 403，防 DNS 重绑定。
+- 再查 `Origin`：不带放行（由上面的 Host 检查兜底）；带了只接受 `http://127.0.0.1:<端口>` 和 `http://localhost:<端口>`，其余 403。
+- 接口不鉴权（已接受风险：只读、只听本机、单用户）。MCP 入口令牌不会出现在页面和任何事件里。
+
+### 12.4 事件
+
+每次运行只发这 10 种事件：`RUN_STARTED`、`RUN_FINISHED`、`RUN_ERROR`、`TEXT_MESSAGE_START/CONTENT/END`、`TOOL_CALL_START/ARGS/END/RESULT`，字段名对齐 `@ag-ui/core` 1.0.3（对拍样例在 `tests/fixtures/agui-events.json`，由 `web/scripts/gen-fixtures.mjs` 生成，Rust 测试只读这个文件，不需要 node）。
+
+- 顺序：`RUN_STARTED` → 每次工具调用 `TOOL_CALL_START/ARGS/END` → `TOOL_CALL_RESULT` → 一组 `TEXT_MESSAGE_START/CONTENT/END` → 终止事件。
+- `TOOL_CALL_RESULT.content` 是 JSON 字符串：成功 `{"ok":true,"request_id":"…","result":"…"}`，失败 `{"ok":false,"request_id":…,"reason":"<原因类别>"}`。`request_id` 来自 MCP 工具结果的 `_meta.request_id`，可对审计。
+- 回答先去掉思考内容，再整段放进**一个** `TEXT_MESSAGE_CONTENT`，不逐字流式。
+- 每次运行**恰好一个**终止事件，之后不再有事件：工具失败或模型没调工具，回「查不到：<原因>。」后发 `RUN_FINISHED`；模型网关出错（连不上、超时、非 2xx、无法解析）发 `RUN_ERROR`（`code` 为 `model_error`），不发 `RUN_FINISHED`。
+- 每秒一行 SSE 注释心跳 `: ping`，不是 AG-UI 事件，客户端忽略即可。客户端断开后服务端最迟约 1 秒发现，随即取消这次运行：不再请求模型网关和 MCP，正在等的请求一并取消；stderr 打一行 `{"event":"run_ended","outcome":"cancelled","running":0,…}`（正常结束为 `finished`，模型出错为 `error`）。
+
+### 12.5 构建页面
+
+```sh
+cd web
+npm ci                         # 按 package-lock.json 安装，不走 CDN
+npm audit --audit-level=high
+npm run build                  # 产出 web/dist/index.html 和 web/dist/app.js
+```
+
+`web/dist/` 不进仓库，由 CI 构建。把 `web/dist` 放到 `countdown_agent` 可执行文件旁边，或用 `COUNTDOWN_AGENT_WEB_DIR` 指过去。`cargo build`、`cargo test` 不需要 node。
+
+CI 里 `npm audit` 遇到高危及以上即失败。这是已接受的约定：代码不动，master 也可能因新公布的漏洞变红；遇到时先看 `npm audit` 输出，确认是新漏洞再决定怎么处理。
+
+### 12.6 已知限制
+
+- 真实 Ollama 和浏览器手工联调未验收（规格验收第 4 条的截图需人工补）；自动测试用假网关加真实 MCP、API。
+- 回答不逐字出现，要等模型整段生成完。
+- 页面不保存历史，刷新即清空。
