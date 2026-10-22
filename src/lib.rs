@@ -3,6 +3,7 @@ use serde::{de, Deserializer};
 use serde_derive::Deserialize;
 use std::{fmt, io::Read, sync::Arc};
 use tokio::sync::Mutex;
+
 /// Repeat mode for recurring countdowns
 #[derive(Debug, Clone, PartialEq)]
 pub enum RepeatMode {

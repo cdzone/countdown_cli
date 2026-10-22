@@ -470,7 +470,7 @@ datetime = "2026-10-11 10:20:30"
         assert!(!item.id.is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn concurrent_posts_produce_exact_count_and_persist() {
         // initial file with one countdown
         let initial = r#"
