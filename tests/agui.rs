@@ -705,3 +705,14 @@ async fn default_page_dir_is_next_to_the_executable() {
         .unwrap_or_else(|| panic!("no warning: {}", server.stderr()));
     assert_eq!(warning["web_dir"], expected.display().to_string());
 }
+
+/// Spec 3.4: the page source loads nothing from another host.
+#[test]
+fn page_source_has_no_external_addresses() {
+    let html =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/web/index.html")).unwrap();
+    for needle in ["http://", "https://", "src=\"//", "href=\"//"] {
+        assert!(!html.contains(needle), "{needle} in web/index.html");
+    }
+    assert!(html.contains("src=\"/app.js\""));
+}

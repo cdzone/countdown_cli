@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>倒计时助手</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 46rem; margin: 2rem auto; padding: 0 1rem; }
+  #log > div { margin: .5rem 0; padding: .5rem .75rem; border-radius: .4rem; white-space: pre-wrap; }
+  .user { background: #e8f0fe; }
+  .assistant { background: #f1f3f4; }
+  .tool { border: 1px solid #c6c6c6; font-size: .9em; }
+  .tool.failed { border-color: #d93025; }
+  .error { background: #fce8e6; }
+  form { display: flex; gap: .5rem; }
+  input { flex: 1; padding: .5rem; }
+</style>
+</head>
+<body>
+<h1>倒计时助手</h1>
+<div id="log"></div>
+<form id="ask">
+  <input id="question" autocomplete="off" placeholder="例如：最近的倒计时是哪个？" required>
+  <button>发送</button>
+</form>
+<script type="module" src="/app.js"></script>
+</body>
+</html>
