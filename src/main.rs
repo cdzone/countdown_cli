@@ -1,7 +1,7 @@
 use chrono::{Local, NaiveDateTime};
 use clap::Parser;
 use colored::*;
-use config::{calculate_target_time, CountDownConfig};
+use countdown_cli::{calculate_target_time, CountDownConfig};
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{cursor, ExecutableCommand};
 use notify::{osx_terminal_notifier, probe_terminal_notifier};
@@ -14,7 +14,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
-mod config;
 mod notify;
 
 pub fn get_styles() -> clap::builder::Styles {
