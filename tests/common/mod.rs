@@ -214,3 +214,73 @@ impl McpClient {
         rpc_body(&body)["result"].clone()
     }
 }
+
+pub fn sha256_hex(s: &str) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(s.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// A token table with one entry per `(id, token, scope)`.
+pub fn token_table(entries: &[(&str, &str, &str)]) -> String {
+    entries
+        .iter()
+        .map(|(id, token, scope)| {
+            format!(
+                "[[token]]\nid = \"{id}\"\nsha256 = \"{}\"\nscopes = [\"{scope}\"]\n",
+                sha256_hex(token)
+            )
+        })
+        .collect()
+}
+
+/// `countdown_cli` with the given args, stdin held open so its terminal loop
+/// blocks instead of spinning on EOF; killed on drop.
+pub struct CliProcess {
+    child: Child,
+    stderr: Arc<Mutex<String>>,
+    _stdin: std::process::ChildStdin,
+}
+
+impl CliProcess {
+    pub fn spawn(args: &[&std::ffi::OsStr]) -> Self {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_countdown_cli"))
+            .args(args)
+            .env_remove("COUNTDOWN_API_TOKENS")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let mut pipe = child.stderr.take().unwrap();
+        let stderr = Arc::new(Mutex::new(String::new()));
+        let sink = stderr.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n @ 1..) = pipe.read(&mut buf) {
+                sink.lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        });
+        Self {
+            child,
+            stderr,
+            _stdin: stdin,
+        }
+    }
+
+    pub fn stderr(&self) -> String {
+        self.stderr.lock().unwrap().clone()
+    }
+}
+
+impl Drop for CliProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}

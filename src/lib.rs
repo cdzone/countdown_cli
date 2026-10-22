@@ -4,6 +4,7 @@ use serde_derive::Deserialize;
 use std::{fmt, io::Read, sync::Arc};
 use tokio::sync::Mutex;
 
+pub mod audit;
 pub mod auth;
 
 /// Repeat mode for recurring countdowns
