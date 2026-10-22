@@ -1,0 +1,18 @@
+{
+  "name": "countdown-agent-web",
+  "version": "0.7.0",
+  "private": true,
+  "description": "countdown_agent 的 AG-UI 对话页面（只做展示）",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "gen-fixtures": "node scripts/gen-fixtures.mjs"
+  },
+  "dependencies": {
+    "@ag-ui/client": "1.0.3"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

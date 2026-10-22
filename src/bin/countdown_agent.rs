@@ -36,6 +36,9 @@ use rmcp::{
 use serde::Serialize;
 use serde_json::Value;
 
+#[path = "agent/agui.rs"]
+mod agui;
+
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:11434/v1";
 const DEFAULT_MCP_URL: &str = "http://127.0.0.1:8765/mcp";
 /// Ollama requires a non-empty key but ignores it.
@@ -53,14 +56,17 @@ list_countdowns 或 get_countdown 查询，只根据工具返回的数据用中�
 不要编造工具没有返回的内容。";
 
 const USAGE: &str = "usage: countdown_agent [question...]
+       countdown_agent --serve [127.0.0.1:PORT]
   With a question: answer it once and exit. Without: read one question per line.
+  --serve: AG-UI server (POST /agui, SSE) plus the web page, default 127.0.0.1:8780.
   Environment:
     COUNTDOWN_AGENT_MODEL           model name (required; must support tool calls)
     COUNTDOWN_AGENT_MCP_TOKEN_FILE  file with the MCP entry token (required, mode 600)
     COUNTDOWN_AGENT_BASE_URL        default http://127.0.0.1:11434/v1 (loopback only)
     COUNTDOWN_AGENT_API_KEY         default: a fixed placeholder
     COUNTDOWN_MCP_URL               default http://127.0.0.1:8765/mcp (loopback only)
-    COUNTDOWN_AGENT_MAX_TOOL_CALLS  tool calls per question, default 5";
+    COUNTDOWN_AGENT_MAX_TOOL_CALLS  tool calls per question, default 5
+    COUNTDOWN_AGENT_WEB_DIR         web page files, default web/dist next to the executable";
 
 struct Config {
     base_url: String,
@@ -255,8 +261,12 @@ struct CallRecord<'a> {
     request_id: Option<&'a str>,
 }
 
-/// Runs one tool call. `Err` is the reason category shown to the user.
-async fn call_tool(mcp: &Mcp, call: &ChatCompletionMessageToolCall) -> Result<String, String> {
+/// Runs one tool call. `Err` is the reason category shown to the user; the
+/// second value is MCP's `_meta.request_id`, when the call reached MCP.
+async fn call_tool(
+    mcp: &Mcp,
+    call: &ChatCompletionMessageToolCall,
+) -> (Result<String, String>, Option<String>) {
     let name = call.function.name.as_str();
     let args: Value = serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
     let started = Instant::now();
@@ -292,7 +302,7 @@ async fn call_tool(mcp: &Mcp, call: &ChatCompletionMessageToolCall) -> Result<St
         "调用记录 {}",
         serde_json::to_string(&record).expect("record is JSON")
     );
-    outcome.map_err(str::to_owned)
+    (outcome.map_err(str::to_owned), request_id)
 }
 
 /// Text of a successful result, or the reason category of a failed one.
@@ -316,21 +326,38 @@ fn tool_outcome(result: &CallToolResult) -> Result<String, &'static str> {
     })
 }
 
-struct Agent {
+/// Everything one question needs; shared by the command line and the
+/// AG-UI server.
+struct Shared {
     gateway: Client<OpenAIConfig>,
     mcp: Mcp,
     tools: Vec<ChatCompletionTools>,
     model: String,
     max_tool_calls: usize,
-    /// System prompt plus earlier questions and final replies only.
-    history: Vec<ChatCompletionRequestMessage>,
 }
 
-impl Agent {
-    /// Answers one question. `Err` means the model gateway itself failed.
-    async fn ask(&mut self, question: &str) -> Result<String, String> {
-        let mut messages = self.history.clone();
-        messages.push(ChatCompletionRequestUserMessage::from(question).into());
+/// Progress of one question, for callers that show tool calls.
+enum Step<'a> {
+    ToolStart {
+        id: &'a str,
+        name: &'a str,
+        args: &'a str,
+    },
+    ToolResult {
+        id: &'a str,
+        outcome: Result<&'a str, &'a str>,
+        request_id: Option<&'a str>,
+    },
+}
+
+impl Shared {
+    /// Answers the last user message in `messages` (system prompt and earlier
+    /// turns first). `Err` means the model gateway itself failed.
+    async fn answer(
+        &self,
+        mut messages: Vec<ChatCompletionRequestMessage>,
+        step: &mut (dyn FnMut(Step<'_>) + Send),
+    ) -> Result<String, String> {
         let mut calls_made = 0;
         let reply = loop {
             let request = CreateChatCompletionRequestArgs::default()
@@ -394,7 +421,18 @@ impl Agent {
                     break;
                 }
                 calls_made += 1;
-                match call_tool(&self.mcp, call).await {
+                step(Step::ToolStart {
+                    id: &call.id,
+                    name: &call.function.name,
+                    args: &call.function.arguments,
+                });
+                let (outcome, request_id) = call_tool(&self.mcp, call).await;
+                step(Step::ToolResult {
+                    id: &call.id,
+                    outcome: outcome.as_deref().map_err(String::as_str),
+                    request_id: request_id.as_deref(),
+                });
+                match outcome {
                     Ok(text) => messages.push(
                         ChatCompletionRequestToolMessage {
                             content: text.into(),
@@ -413,6 +451,22 @@ impl Agent {
                 break not_found(&reason);
             }
         };
+        Ok(reply)
+    }
+}
+
+struct Agent {
+    shared: Shared,
+    /// System prompt plus earlier questions and final replies only.
+    history: Vec<ChatCompletionRequestMessage>,
+}
+
+impl Agent {
+    /// Answers one question. `Err` means the model gateway itself failed.
+    async fn ask(&mut self, question: &str) -> Result<String, String> {
+        let mut messages = self.history.clone();
+        messages.push(ChatCompletionRequestUserMessage::from(question).into());
+        let reply = self.shared.answer(messages, &mut |_| {}).await?;
         self.history
             .push(ChatCompletionRequestUserMessage::from(question).into());
         self.history
@@ -427,11 +481,31 @@ fn env_var(name: &str) -> Option<String> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let question = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let question = args.join(" ");
     if question == "-h" || question == "--help" {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
+    let serve = match args.first().map(String::as_str) {
+        Some("--serve") => match args.get(1..) {
+            Some([]) | None => Some(agui::DEFAULT_ADDR.to_owned()),
+            Some([addr]) => Some(addr.clone()),
+            Some(_) => {
+                eprintln!("countdown_agent: --serve takes at most one address\n{USAGE}");
+                return ExitCode::from(2);
+            }
+        },
+        _ => None,
+    };
+    let listen = match serve.as_deref().map(agui::listen_addr) {
+        None => None,
+        Some(Ok(addr)) => Some(addr),
+        Some(Err(e)) => {
+            eprintln!("countdown_agent: {e}\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
     let cfg = match Config::load(env_var) {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -446,12 +520,22 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let mut agent = Agent {
+    let shared = Shared {
         gateway: cfg.gateway(),
         mcp,
         tools,
         model: cfg.model,
         max_tool_calls: cfg.max_tool_calls,
+    };
+    if let Some(addr) = listen {
+        let web_dir = agui::web_dir(
+            env_var(agui::WEB_DIR_VAR),
+            std::env::current_exe().ok().as_deref(),
+        );
+        return agui::serve(std::sync::Arc::new(shared), addr, web_dir).await;
+    }
+    let mut agent = Agent {
+        shared,
         history: vec![ChatCompletionRequestSystemMessage::from(SYSTEM_PROMPT).into()],
     };
     if !question.is_empty() {

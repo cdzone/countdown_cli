@@ -19,6 +19,29 @@ jobs:
       - name: cargo test
         run: cargo test --locked
 
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: npm ci
+        run: npm ci
+      # High or critical advisories fail CI, even with no code change (accepted).
+      - name: npm audit
+        run: npm audit --audit-level=high
+      - name: build (fails on external script or style addresses)
+        run: npm run build
+      - name: dist stays out of git
+        run: test -z "$(git ls-files dist node_modules)"
+      - name: AG-UI samples match @ag-ui/core
+        run: npm run gen-fixtures && git diff --exit-code ../tests/fixtures/agui-events.json
+
   deny:
     runs-on: ubuntu-latest
     timeout-minutes: 15
