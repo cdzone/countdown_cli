@@ -4,20 +4,14 @@ use serde_derive::Deserialize;
 use std::{fmt, io::Read, sync::Arc};
 use tokio::sync::Mutex;
 
-/// 热加载特性
-pub trait HotReload {
-    async fn reload(&mut self) -> Result<(), Box<dyn std::error::Error>>;
-}
-
-/// 重复模式（每日/工作日）
+/// Repeat mode for recurring countdowns
 #[derive(Debug, Clone, PartialEq)]
 pub enum RepeatMode {
-    /// 每日
+    /// Repeats every day
     Daily,
-    /// 工作日（周一至周五）
+    /// Repeats every weekday (Monday to Friday)
     Weekday,
 }
-
 impl fmt::Display for RepeatMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -42,6 +36,10 @@ impl<'de> de::Deserialize<'de> for RepeatMode {
             ))),
         }
     }
+}
+
+pub(crate) trait HotReload {
+    async fn reload(&mut self) -> Result<(), Box<dyn std::error::Error>>;
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -93,7 +91,7 @@ impl CountDownConfig {
         })
     }
 
-    /// 当配置文件的 mtime 变化时才重新加载（避免每次都读盘）
+    /// Reload only when the config file mtime changed (stat, not full re-read every tick).
     pub async fn reload_if_changed(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
         let modified = std::fs::metadata(&self.config_filename)?.modified()?;
         if self.last_mtime == Some(modified) {
@@ -128,12 +126,17 @@ impl HotReload for CountDownConfig {
     }
 }
 
-/// 计算给定重复模式下的目标时间
+/// Calculate the target datetime for a recurring countdown based on current time.
 ///
-/// - Daily：返回当天目标时间；在 00:00 之后仍返回当天目标（用于“已过”显示）
-/// - Weekday：工作日返回当天目标；周末返回周五的目标；周一 00:00 返回周一目标
+/// For repeat modes:
+/// - `Daily`: Returns today's target time. At midnight (00:00), switches to today's target.
+/// - `Weekday`: Returns the appropriate target time based on current day:
+///   - On weekdays before target time: returns today's target
+///   - On weekdays after target time: returns today's target (for elapsed display)
+///   - On weekends: returns last Friday's target (for elapsed display)
+///   - On Monday 00:00: switches to Monday's target
 ///
-/// 若解析失败返回 None。
+/// Returns `None` if the datetime string cannot be parsed.
 pub fn calculate_target_time(
     datetime_str: &str,
     repeat: Option<&RepeatMode>,
@@ -154,17 +157,17 @@ pub fn calculate_target_time(
 
             match weekday {
                 Weekday::Sat => {
-                    // 周六：返回周五目标
+                    // Saturday: return Friday's target time
                     let friday = now.date() - chrono::Duration::days(1);
                     Some(friday.and_time(target_time))
                 }
                 Weekday::Sun => {
-                    // 周日：返回周五目标
+                    // Sunday: return Friday's target time
                     let friday = now.date() - chrono::Duration::days(2);
                     Some(friday.and_time(target_time))
                 }
                 _ => {
-                    // 工作日：返回当天目标
+                    // Weekday: return today's target time
                     Some(now.date().and_time(target_time))
                 }
             }

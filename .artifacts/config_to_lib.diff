@@ -1,0 +1,91 @@
+--- .artifacts/master_config.rs	2026-10-22 07:12:53.110176932 +0000
++++ .artifacts/branch_lib.rs	2026-10-22 07:12:53.110176932 +0000
+@@ -4,12 +4,17 @@
+ use std::{fmt, io::Read, sync::Arc};
+ use tokio::sync::Mutex;
+ 
+-/// Repeat mode for recurring countdowns
++/// 热加载特性
++pub trait HotReload {
++    async fn reload(&mut self) -> Result<(), Box<dyn std::error::Error>>;
++}
++
++/// 重复模式（每日/工作日）
+ #[derive(Debug, Clone, PartialEq)]
+ pub enum RepeatMode {
+-    /// Repeats every day
++    /// 每日
+     Daily,
+-    /// Repeats every weekday (Monday to Friday)
++    /// 工作日（周一至周五）
+     Weekday,
+ }
+ 
+@@ -39,10 +44,6 @@
+     }
+ }
+ 
+-pub trait HotReload {
+-    async fn reload(&mut self) -> Result<(), Box<dyn std::error::Error>>;
+-}
+-
+ #[derive(Debug, Clone, Deserialize)]
+ pub struct Countdown {
+     pub title: String,
+@@ -92,7 +93,7 @@
+         })
+     }
+ 
+-    /// Reload only when the config file mtime changed (stat, not full re-read every tick).
++    /// 当配置文件的 mtime 变化时才重新加载（避免每次都读盘）
+     pub async fn reload_if_changed(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
+         let modified = std::fs::metadata(&self.config_filename)?.modified()?;
+         if self.last_mtime == Some(modified) {
+@@ -127,17 +128,12 @@
+     }
+ }
+ 
+-/// Calculate the target datetime for a recurring countdown based on current time.
++/// 计算给定重复模式下的目标时间
+ ///
+-/// For repeat modes:
+-/// - `Daily`: Returns today's target time. At midnight (00:00), switches to today's target.
+-/// - `Weekday`: Returns the appropriate target time based on current day:
+-///   - On weekdays before target time: returns today's target
+-///   - On weekdays after target time: returns today's target (for elapsed display)
+-///   - On weekends: returns last Friday's target (for elapsed display)
+-///   - On Monday 00:00: switches to Monday's target
++/// - Daily：返回当天目标时间；在 00:00 之后仍返回当天目标（用于“已过”显示）
++/// - Weekday：工作日返回当天目标；周末返回周五的目标；周一 00:00 返回周一目标
+ ///
+-/// Returns `None` if the datetime string cannot be parsed.
++/// 若解析失败返回 None。
+ pub fn calculate_target_time(
+     datetime_str: &str,
+     repeat: Option<&RepeatMode>,
+@@ -158,17 +154,17 @@
+ 
+             match weekday {
+                 Weekday::Sat => {
+-                    // Saturday: return Friday's target time
++                    // 周六：返回周五目标
+                     let friday = now.date() - chrono::Duration::days(1);
+                     Some(friday.and_time(target_time))
+                 }
+                 Weekday::Sun => {
+-                    // Sunday: return Friday's target time
++                    // 周日：返回周五目标
+                     let friday = now.date() - chrono::Duration::days(2);
+                     Some(friday.and_time(target_time))
+                 }
+                 _ => {
+-                    // Weekday: return today's target time
++                    // 工作日：返回当天目标
+                     Some(now.date().and_time(target_time))
+                 }
+             }
+@@ -420,3 +416,4 @@
+         );
+     }
+ }
++

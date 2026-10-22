@@ -1,0 +1,27 @@
+
+running 22 tests
+test config::tests::test_daily_mode_at_midnight ... ok
+test config::tests::test_daily_mode_before_target ... ok
+test config::tests::test_calculate_target_time_no_repeat ... ok
+test config::tests::test_daily_mode_midnight_target ... ok
+test config::tests::test_daily_mode_after_target ... ok
+test config::tests::test_daily_mode_year_boundary ... ok
+test config::tests::test_repeat_mode_deserialize_none ... ok
+test config::tests::test_repeat_mode_deserialize_weekday ... ok
+test config::tests::test_repeat_mode_deserialize_workday_alias ... ok
+test config::tests::test_repeat_mode_display ... ok
+test config::tests::test_repeat_mode_deserialize_daily ... ok
+test config::tests::test_weekday_mode_friday_after_target ... ok
+test config::tests::test_weekday_mode_monday_after_target ... ok
+test config::tests::test_weekday_mode_monday_midnight ... ok
+test config::tests::test_weekday_mode_saturday ... ok
+test config::tests::test_weekday_mode_sunday ... ok
+test config::tests::test_weekday_mode_wednesday_before_target ... ok
+test pomodoro_interval_tests::work_end_enters_long_break_on_interval ... ok
+test pomodoro_interval_tests::interval_one_always_long_break ... ok
+test pomodoro_interval_tests::work_end_enters_short_break_before_interval ... ok
+test pomodoro_interval_tests::zero_interval_treated_as_one ... ok
+test notify::tests::probe_reports_installed_or_missing_clearly ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
