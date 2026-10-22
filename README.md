@@ -1,6 +1,6 @@
 # countdown_cli
 
-终端倒计时 / 番茄钟小工具，可选开一个只听回环地址的 HTTP API（`--api`），另带一个只读的 MCP 服务 `countdown_mcp`，把 API 里的提醒暴露给 MCP 客户端。
+终端倒计时 / 番茄钟小工具，可选开一个只听回环地址的 HTTP API（`--api`），另带一个只读的 MCP 服务 `countdown_mcp`，把 API 里的提醒暴露给 MCP 客户端；还带一个命令行智能体 `countdown_agent`，用本机模型通过 MCP 回答倒计时问题（第 11 节）。
 
 本文只写鉴权、审计和部署相关的用法。完整参数以 `countdown_cli --help`、`countdown_mcp --help` 为准。
 
@@ -256,3 +256,78 @@ MCP_STORAGE_DIR=$(mktemp -d) npx @modelcontextprotocol/inspector@2.12.0 --cli \
 - 不做令牌热加载、限流、日志外送和服务内轮转；没有终端用户级别的权限，只认到「哪个程序在调」。
 - API 和 MCP 同写一个审计文件没有测过，不要这样配。
 - MCP 审计目前只记工具调用、启动探测异常和入口拒绝；规格要求的协议层请求（initialize、tools/list 等）的 `rpc:<方法>` 行本版还没有实现。
+
+## 11. 命令行智能体 `countdown_agent`
+
+```
+你 ──问题──▶ countdown_agent ──▶ 本机模型网关（Ollama，OpenAI 兼容接口）
+                   │                └─ 决定调哪个工具
+                   └──Bearer(MCP 入口令牌)──▶ countdown_mcp ──▶ countdown_cli --api
+```
+
+智能体只经 MCP 的两个只读工具 `list_countdowns`、`get_countdown` 取数，不直连 API，也不知道 API 地址。
+
+### 11.1 准备
+
+1. 在 MCP 的入口令牌表（`--tokens`）里给智能体**单独登记一行**，只给 `countdowns:read`，不要和 MCP 调 API 的服务令牌共用：
+
+   ```sh
+   umask 077
+   openssl rand -hex 32 > agent.token
+   tr -d '\n' < agent.token | sha256sum | cut -d' ' -f1   # 填进下面的 sha256
+   ```
+
+   ```toml
+   [[token]]
+   id = "countdown-agent"
+   sha256 = "<上面算出的摘要>"
+   scopes = ["countdowns:read"]
+   ```
+
+   `agent.token` 的格式和权限要求同 3.2（一行明文、`chmod 600`）。
+
+2. 本机 Ollama 版本 ≥ v0.32.6，保持默认只听 `127.0.0.1:11434`，**不要**把 `OLLAMA_HOST` 改成 `0.0.0.0`。先确认模型会调工具：`ollama show deepseek-r1:8b` 的 Capabilities 里要有 `tools`，没有就 `ollama pull deepseek-r1:8b` 更新后再看。
+
+### 11.2 配置（只走环境变量）
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `COUNTDOWN_AGENT_MODEL` | 无，必填 | 模型名，须支持工具调用。代码里不写模型名；验收默认用 `deepseek-r1:8b`，换模型只改这一项 |
+| `COUNTDOWN_AGENT_MCP_TOKEN_FILE` | 无，必填 | 上面的 `agent.token` |
+| `COUNTDOWN_AGENT_BASE_URL` | `http://127.0.0.1:11434/v1` | 模型网关地址，主机只能是 `127.0.0.1`、`localhost`、`::1`，只支持 `http://` |
+| `COUNTDOWN_AGENT_API_KEY` | 固定占位值 `ollama` | Ollama 要求非空但不校验，一般不用设 |
+| `COUNTDOWN_MCP_URL` | `http://127.0.0.1:8765/mcp` | MCP 地址，主机限制同上（入口令牌不会发到别的机器） |
+| `COUNTDOWN_AGENT_MAX_TOOL_CALLS` | `5` | 单个问题最多调几次工具，超了停止并回「查不到」 |
+
+缺必填项、地址不是本机、令牌文件不合格：退出码 2，stderr 写明是哪一项。`OPENAI_BASE_URL`、`OPENAI_API_KEY` 等 `OPENAI_*` 变量设了也不起作用：地址和 key 总是显式设置，组织、项目请求头也显式清空。
+
+### 11.3 用法
+
+```sh
+export COUNTDOWN_AGENT_MODEL=deepseek-r1:8b
+export COUNTDOWN_AGENT_MCP_TOKEN_FILE=$PWD/agent.token
+countdown_agent "最近的倒计时是哪个？"   # 问一次就退出
+countdown_agent                          # 不带参数：一行一个问题，Ctrl-D 退出
+```
+
+- 回答写到 stdout。每次工具调用在 stderr 打一行调用记录，例如：
+
+  ```
+  调用记录 {"tool":"list_countdowns","args":{},"ok":true,"duration_ms":12,"request_id":"6f0c…"}
+  ```
+
+  `request_id` 由 MCP 在工具结果的 `_meta.request_id` 里返回，智能体不自己生成，可以拿它去对 MCP 和 API 的审计行。调用记录不含工具返回的数据和模型的文字。
+- 启动时先连 MCP 并列工具：连不上或缺 `list_countdowns` / `get_countdown`，stderr 输出一行 JSON 告警（`"level":"alert"`，`event` 为 `mcp_unavailable` 或 `mcp_tools_missing`），退出码 2。
+- 下面几种情况由程序直接回固定文案「查不到：<原因>。」，不再把结果交给模型：工具报错（`isError`）、API 拒绝（401/403）、连不上 MCP、工具超时（30 秒）、模型要调清单外的工具或参数不是 JSON 对象、超过工具调用上限。
+- 模型没调任何工具就直接回答：判为失败，回「查不到」，不显示模型的回答（Ollama 不支持 `tool_choice`，没法强制调工具）。
+- 推理模型的「思考」内容（`<think>…</think>` 段，或单独的 `reasoning` / `reasoning_content` 字段）不显示、不写进调用记录，也不回传给模型。
+- 模型网关出错（连不上、超时 300 秒、返回格式不对）：stderr 打错误；单次提问模式退出码 1，多轮模式继续等下一行。
+
+### 11.4 已知限制
+
+- 第 5 步只用假网关测过；**真实 Ollama 联调未验收**，模型调工具准不准、思考输出对工具调用的影响都没有实测。
+- 智能体只回答倒计时问题：每个问题都要求模型至少调一次工具，所以打招呼、闲聊也会得到「查不到」。
+- 多轮对话只保留之前的问题和最终回答，不保留工具结果；追问时模型要重新查。
+- 不流式输出，回答要等模型整段生成完；推理模型会比较慢。
+- 只接 OpenAI Chat Completions 格式的 `tool_calls`；较老的 Ollama（< v0.12.11）可能漏掉 `tool_call_id`，会导致解析失败，所以要求 ≥ v0.32.6。
+- `async-openai` 的 `OpenAIConfig::new()` 内部仍会读一次 `OPENAI_*` 环境变量，读到的值随即被显式设置覆盖，不会被发出（有测试断言）。
