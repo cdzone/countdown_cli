@@ -24,14 +24,14 @@ fn tables() -> String {
 /// Runs `countdown_cli --api` to completion; it must refuse to start.
 fn refused(dir: &Path, extra: &[&OsStr]) -> std::process::Output {
     let config = dir.join("c.toml");
-    Command::new(env!("CARGO_BIN_EXE_countdown_cli"))
-        .env_remove("COUNTDOWN_API_TOKENS")
-        .arg("-c")
-        .arg(&config)
-        .args(["--api", "127.0.0.1:0"])
-        .args(extra)
-        .output()
-        .unwrap()
+    common::output_with_deadline(
+        Command::new(env!("CARGO_BIN_EXE_countdown_cli"))
+            .env_remove("COUNTDOWN_API_TOKENS")
+            .arg("-c")
+            .arg(&config)
+            .args(["--api", "127.0.0.1:0"])
+            .args(extra),
+    )
 }
 
 #[test]
@@ -104,17 +104,29 @@ async fn start_api(dir: &Path, audit: &Path) -> (CliProcess, String) {
     ]);
     let base = format!("http://{addr}");
     let http = client();
-    for _ in 0..100 {
-        if http.get(format!("{base}/countdowns")).send().await.is_ok() {
+    // The port is bound before the server runs, so a probe can connect and
+    // then wait forever: bound each probe and the whole wait.
+    let deadline = std::time::Instant::now() + common::PROCESS_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        let probe = http
+            .get(format!("{base}/countdowns"))
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await;
+        if probe.is_ok() {
             return (proc, base);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("API did not start: {}", proc.stderr());
+    panic!(
+        "API at {base} did not answer within {:?}; stderr: {}",
+        common::PROCESS_TIMEOUT,
+        proc.stderr()
+    );
 }
 
 fn client() -> reqwest::Client {
-    reqwest::Client::builder().no_proxy().build().unwrap()
+    common::http_client()
 }
 
 fn audit_lines(path: &Path) -> Vec<Value> {

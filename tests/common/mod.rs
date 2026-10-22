@@ -16,6 +16,64 @@ use serde_json::{json, Value};
 
 pub const SERVICE_TOKEN: &str = "svc-token-0123456789abcdef0123456789abcdef";
 
+/// Upper bound for one HTTP request in tests: a server that accepts the
+/// connection but never answers must fail the test, not hang CI.
+pub const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Upper bound for waiting on a child process or its stderr reader.
+pub const PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A reqwest client for tests: no proxy, every request bounded by `HTTP_TIMEOUT`.
+pub fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .unwrap()
+}
+
+/// Joins a stderr reader thread, panicking instead of blocking forever when
+/// the pipe stays open (e.g. inherited by a grandchild).
+fn join_reader(reader: JoinHandle<()>, stderr: &Arc<Mutex<String>>) {
+    let deadline = Instant::now() + PROCESS_TIMEOUT;
+    while !reader.is_finished() {
+        if Instant::now() >= deadline {
+            panic!(
+                "stderr reader still open after {PROCESS_TIMEOUT:?}; stderr so far: {}",
+                stderr.lock().unwrap()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = reader.join();
+}
+
+/// Runs `cmd` to completion with stdin closed; kills it and panics if it is
+/// still running after `PROCESS_TIMEOUT`.
+pub fn output_with_deadline(cmd: &mut Command) -> std::process::Output {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + PROCESS_TIMEOUT;
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let out = child.wait_with_output().unwrap();
+            panic!(
+                "process did not exit within {PROCESS_TIMEOUT:?}; stderr: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 pub fn free_port() -> u16 {
     StdListener::bind("127.0.0.1:0")
         .unwrap()
@@ -94,7 +152,7 @@ impl McpProcess {
 
     /// Waits until stderr contains `needle`.
     pub fn wait_for_stderr(&self, needle: &str) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + PROCESS_TIMEOUT;
         while Instant::now() < deadline {
             if self.stderr().contains(needle) {
                 return true;
@@ -106,10 +164,12 @@ impl McpProcess {
 
     /// Waits for the process to exit on its own; `None` if it keeps running.
     pub fn wait_exit(&mut self) -> Option<ExitStatus> {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + PROCESS_TIMEOUT;
         while Instant::now() < deadline {
             if let Some(status) = self.child.try_wait().unwrap() {
-                self.reader.take().map(JoinHandle::join);
+                if let Some(reader) = self.reader.take() {
+                    join_reader(reader, &self.stderr);
+                }
                 return Some(status);
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -121,13 +181,18 @@ impl McpProcess {
     pub fn finish(mut self) -> String {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        self.reader.take().map(JoinHandle::join);
+        if let Some(reader) = self.reader.take() {
+            join_reader(reader, &self.stderr);
+        }
         self.stderr()
     }
 }
 
 impl Drop for McpProcess {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("countdown_mcp stderr:\n{}", self.stderr());
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -161,7 +226,7 @@ impl McpClient {
     pub async fn connect(url: String, authorization: Option<&str>) -> Self {
         let mut client = Self {
             url,
-            http: reqwest::Client::builder().no_proxy().build().unwrap(),
+            http: http_client(),
             session: None,
             authorization: authorization.map(str::to_owned),
         };
@@ -169,16 +234,18 @@ impl McpClient {
             "protocolVersion":"2025-06-18","capabilities":{},
             "clientInfo":{"name":"test","version":"0"}}});
         let mut resp = None;
-        for _ in 0..50 {
-            match client.post(init.clone()).await {
-                Ok(r) => {
+        let deadline = Instant::now() + PROCESS_TIMEOUT;
+        while Instant::now() < deadline {
+            let attempt = tokio::time::timeout(Duration::from_secs(1), client.post(init.clone()));
+            match attempt.await {
+                Ok(Ok(r)) => {
                     resp = Some(r);
                     break;
                 }
-                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+                _ => tokio::time::sleep(Duration::from_millis(100)).await,
             }
         }
-        let resp = resp.expect("countdown_mcp did not start");
+        let resp = resp.unwrap_or_else(|| panic!("countdown_mcp did not start at {}", client.url));
         client.session = resp
             .headers()
             .get("mcp-session-id")
@@ -280,6 +347,11 @@ impl CliProcess {
 
 impl Drop for CliProcess {
     fn drop(&mut self) {
+        // A timed-out request panics; show what the API said so a red CI run
+        // explains itself.
+        if std::thread::panicking() {
+            eprintln!("countdown_cli stderr:\n{}", self.stderr());
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }

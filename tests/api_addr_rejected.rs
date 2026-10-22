@@ -1,3 +1,5 @@
+mod common;
+
 use std::process::Command;
 
 const CONFIG: &str = r#"# keep me
@@ -12,13 +14,13 @@ fn rejected_api_addr_leaves_config_untouched() {
     let config = dir.path().join("c.toml");
     std::fs::write(&config, CONFIG).unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_countdown_cli"))
-        .arg("-c")
-        .arg(&config)
-        .arg("--api")
-        .arg("0.0.0.0:0")
-        .output()
-        .unwrap();
+    let output = common::output_with_deadline(
+        Command::new(env!("CARGO_BIN_EXE_countdown_cli"))
+            .arg("-c")
+            .arg(&config)
+            .arg("--api")
+            .arg("0.0.0.0:0"),
+    );
 
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(std::fs::read_to_string(&config).unwrap(), CONFIG);
