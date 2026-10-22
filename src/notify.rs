@@ -1,13 +1,17 @@
+#[cfg(target_os = "macos")]
 use std::io::ErrorKind;
+#[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
 
 /// Probe whether `terminal-notifier` is on PATH (macOS notification backend).
 ///
 /// Returns `Ok(())` if the binary can be spawned. Missing binary is `Err` with
 /// an install hint; other spawn failures are also `Err`.
+#[cfg(target_os = "macos")]
 pub fn probe_terminal_notifier() -> Result<(), String> {
     match Command::new("terminal-notifier")
         .arg("-help")
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -21,6 +25,13 @@ pub fn probe_terminal_notifier() -> Result<(), String> {
     }
 }
 
+/// Desktop notifications are macOS-only; elsewhere nothing is spawned.
+#[cfg(not(target_os = "macos"))]
+pub fn probe_terminal_notifier() -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 pub async fn osx_terminal_notifier(
     title: &str,
     content: &str,
@@ -40,6 +51,7 @@ pub async fn osx_terminal_notifier(
 
     let mut cmd = Command::new("terminal-notifier");
     cmd.args(["-message", message, "-title", title, "-group", title])
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
@@ -52,6 +64,7 @@ pub async fn osx_terminal_notifier(
     if let Some(sound_path) = custom_sound {
         let mut sound_process = Command::new("ffplay")
             .args(["-i", sound_path, "-autoexit", "-nodisp"])
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()?;
@@ -61,6 +74,16 @@ pub async fn osx_terminal_notifier(
     }
 
     let _ = notify_window.wait();
+    Ok(())
+}
+
+/// Desktop notifications are macOS-only; elsewhere this does nothing.
+#[cfg(not(target_os = "macos"))]
+pub async fn osx_terminal_notifier(
+    _title: &str,
+    _content: &str,
+    _sound: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 

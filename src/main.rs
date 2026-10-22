@@ -53,6 +53,17 @@ struct CliArgs {
         help = "Bind HTTP API on loopback address (e.g. 127.0.0.1:8080)"
     )]
     api: Option<String>,
+    #[arg(
+        long = "api-tokens",
+        env = "COUNTDOWN_API_TOKENS",
+        help = "Token table (TOML) for --api; required with --api"
+    )]
+    api_tokens: Option<std::path::PathBuf>,
+    #[arg(
+        long = "audit-log",
+        help = "Audit log (JSON Lines) for --api [default: countdown-audit.jsonl next to the config file]"
+    )]
+    audit_log: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -474,6 +485,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => None,
     };
+    // 顺序：地址 → 令牌 → 审计 → store，前一步失败后面都不做
+    let api_gate = api_listener.as_ref().map(|_| api_gate(&cli_args));
     let store = CountdownStore::new(file_path, api_listener.is_some()).await?;
 
     let running = Arc::new(AtomicBool::new(true));
@@ -495,9 +508,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await
     });
-    if let Err(msg) = probe_terminal_notifier() {
-        eprintln!("警告: {msg}");
-    }
+    // 探测放到独立线程：通知程序卡住也不能挡住下面的 API 启动
+    std::thread::spawn(|| {
+        if let Err(msg) = probe_terminal_notifier() {
+            eprintln!("警告: {msg}");
+        }
+    });
 
     let store_for_reload = store.clone();
     let _reload_handle = tokio::spawn(async move {
@@ -509,8 +525,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // 启动HTTP API（仅接受回环地址）
-    if let Some(listener) = api_listener {
-        let router = api::build_router(store.clone());
+    if let (Some(listener), Some(gate)) = (api_listener, api_gate) {
+        let router = api::build_router(store.clone(), gate);
         // 不写stdout；axum默认不输出日志
         tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, router).await {
@@ -522,6 +538,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     countdown_handle.await?;
 
     Ok(())
+}
+
+/// Loads the API token table, then checks the audit log can be written.
+/// Either failing exits with code 2 before the config file is touched.
+fn api_gate(args: &CliArgs) -> api::Gate {
+    let Some(tokens_path) = &args.api_tokens else {
+        eprintln!("错误：--api 需要 --api-tokens <令牌表>（或环境变量 COUNTDOWN_API_TOKENS）");
+        std::process::exit(2);
+    };
+    let tokens = countdown_cli::auth::TokenTable::load(tokens_path).unwrap_or_else(|e| {
+        eprintln!("错误：--api-tokens {}: {e}", tokens_path.display());
+        std::process::exit(2);
+    });
+    let audit_path = args.audit_log.clone().unwrap_or_else(|| {
+        std::path::Path::new(&args.config_file).with_file_name("countdown-audit.jsonl")
+    });
+    let audit = countdown_cli::audit::AuditLog::open(&audit_path).unwrap_or_else(|e| {
+        eprintln!("错误：--audit-log {}: {e}", audit_path.display());
+        std::process::exit(2);
+    });
+    api::Gate::new(tokens, audit)
 }
 
 #[cfg(test)]

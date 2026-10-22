@@ -260,6 +260,20 @@ impl std::error::Error for TokenTableError {
     }
 }
 
+/// `WWW-Authenticate` value for a 401, shared by the API and MCP so both
+/// challenge the same way. `invalid_token` is set when a bearer token was
+/// presented (empty or unknown); `scope` hints what a caller should ask for.
+pub fn bearer_challenge(invalid_token: bool, scope: Option<Scope>) -> String {
+    let mut value = String::from("Bearer realm=\"countdown\"");
+    if invalid_token {
+        value.push_str(", error=\"invalid_token\"");
+    }
+    if let Some(scope) = scope {
+        value.push_str(&format!(", scope=\"{}\"", scope.as_str()));
+    }
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
