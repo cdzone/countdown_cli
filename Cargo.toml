@@ -2,6 +2,8 @@
 name = "countdown_cli"
 version = "0.3.1"
 edition = "2021"
+rust-version = "1.89"
+default-run = "countdown_cli"
 license = "MIT"
 
 [profile.release]
@@ -16,12 +18,14 @@ toml = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_derive = "1"
 colored = "3"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 axum = "0.8"
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
 toml_edit = "0.22"
 tower = "0.5"
+rmcp = { version = "3.6", features = ["server", "macros", "transport-streamable-http-server"] }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6"

@@ -14,8 +14,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
-mod notify;
 mod api;
+mod notify;
 
 pub fn get_styles() -> clap::builder::Styles {
     use clap::builder::styling::*;
@@ -48,7 +48,10 @@ struct CliArgs {
         help = "Set long break interval (number of work sessions)"
     )]
     long_break_interval: Option<u32>,
-    #[arg(long = "api", help = "Bind HTTP API on loopback address (e.g. 127.0.0.1:8080)")]
+    #[arg(
+        long = "api",
+        help = "Bind HTTP API on loopback address (e.g. 127.0.0.1:8080)"
+    )]
     api: Option<String>,
 }
 
@@ -245,11 +248,9 @@ async fn terminal_run(
             .filter(|countdown| countdown.enabled)
             .filter_map(|countdown| {
                 match calculate_target_time(&countdown.datetime, countdown.repeat.as_ref(), now) {
-                    Some(datetime) => Some((
-                        countdown.title.clone(),
-                        datetime,
-                        countdown.id.clone(),
-                    )),
+                    Some(datetime) => {
+                        Some((countdown.title.clone(), datetime, countdown.id.clone()))
+                    }
                     None => {
                         println!(
                             "错误：'{}' 的日期时间格式无效。请使用 'YYYY-MM-DD HH:MM:SS' 格式。",
@@ -341,8 +342,12 @@ async fn terminal_run(
         for (title, target_datetime, id_opt) in target_datetimes.iter() {
             let remaining = *target_datetime - now;
             let remaining_seconds = remaining.num_seconds();
-            let notify_now =
-                should_notify(&mut notified_at_zero, id_opt.as_deref(), title, remaining_seconds);
+            let notify_now = should_notify(
+                &mut notified_at_zero,
+                id_opt.as_deref(),
+                title,
+                remaining_seconds,
+            );
 
             let message = match remaining_seconds {
                 86401_i64..=i64::MAX => {

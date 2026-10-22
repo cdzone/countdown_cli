@@ -34,13 +34,10 @@ impl ApiCountdown {
             title: countdown.title.clone(),
             datetime: countdown.datetime.clone(),
             enabled: countdown.enabled,
-            repeat: countdown
-                .repeat
-                .as_ref()
-                .map(|r| match r {
-                    RepeatMode::Daily => "daily".to_string(),
-                    RepeatMode::Weekday => "weekday".to_string(),
-                }),
+            repeat: countdown.repeat.as_ref().map(|r| match r {
+                RepeatMode::Daily => "daily".to_string(),
+                RepeatMode::Weekday => "weekday".to_string(),
+            }),
             target_time: target.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
             remaining_seconds,
         })
@@ -95,7 +92,9 @@ pub fn build_router(store: Arc<CountdownStore>) -> Router {
         .route("/countdowns", get(list_countdowns).post(create_countdown))
         .route(
             "/countdowns/{id}",
-            get(get_countdown).put(update_countdown).delete(delete_countdown),
+            get(get_countdown)
+                .put(update_countdown)
+                .delete(delete_countdown),
         )
         .with_state(ApiState { store })
 }
@@ -106,9 +105,7 @@ async fn list_countdowns(
     State(state): State<ApiState>,
     Query(query): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let enabled_filter = query
-        .get("enabled")
-        .and_then(|v| v.parse::<bool>().ok());
+    let enabled_filter = query.get("enabled").and_then(|v| v.parse::<bool>().ok());
     let now = Local::now().naive_local();
     let data = state.store.read_data().await;
     let mut items: Vec<ApiCountdown> = data
@@ -125,10 +122,7 @@ async fn list_countdowns(
     Json(items)
 }
 
-async fn get_countdown(
-    State(state): State<ApiState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+async fn get_countdown(State(state): State<ApiState>, Path(id): Path<String>) -> impl IntoResponse {
     let now = Local::now().naive_local();
     let data = state.store.read_data().await;
     if let Some(found) = data.countdown.iter().find(|c| c.id.as_deref() == Some(&id)) {
@@ -191,7 +185,13 @@ async fn create_countdown(
                 repeat: created
                     .repeat
                     .as_ref()
-                    .map(|r| if matches!(r, RepeatMode::Daily) { "daily" } else { "weekday" })
+                    .map(|r| {
+                        if matches!(r, RepeatMode::Daily) {
+                            "daily"
+                        } else {
+                            "weekday"
+                        }
+                    })
                     .map(|s| s.to_string()),
                 target_time: None,
                 remaining_seconds: None,
@@ -246,10 +246,10 @@ async fn delete_countdown(
 mod tests {
     use super::*;
     use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt as _;
     use std::{fs, io::Write};
     use tempfile::tempdir;
     use tower::ServiceExt;
-    use http_body_util::BodyExt as _;
 
     fn sample_toml() -> String {
         r#"# sample demo
@@ -267,7 +267,14 @@ repeat = "workday"
         .to_string()
     }
 
-    async fn setup_router_with_file(content: &str) -> (Router, Arc<CountdownStore>, tempfile::TempDir, std::path::PathBuf) {
+    async fn setup_router_with_file(
+        content: &str,
+    ) -> (
+        Router,
+        Arc<CountdownStore>,
+        tempfile::TempDir,
+        std::path::PathBuf,
+    ) {
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.toml");
         fs::write(&path, content).unwrap();
@@ -288,10 +295,12 @@ repeat = "workday"
         });
         let res = router
             .clone()
-            .oneshot(Request::post("/countdowns")
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap())
+            .oneshot(
+                Request::post("/countdowns")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::CREATED);
@@ -302,7 +311,11 @@ repeat = "workday"
         // GET single
         let res = router
             .clone()
-            .oneshot(Request::get(format!("/countdowns/{}", created.id)).body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::get(format!("/countdowns/{}", created.id))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
@@ -315,10 +328,12 @@ repeat = "workday"
         });
         let res = router
             .clone()
-            .oneshot(Request::put(format!("/countdowns/{}", created.id))
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
-                .unwrap())
+            .oneshot(
+                Request::put(format!("/countdowns/{}", created.id))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
@@ -328,7 +343,11 @@ repeat = "workday"
         // DELETE
         let res = router
             .clone()
-            .oneshot(Request::delete(format!("/countdowns/{}", updated.id)).body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::delete(format!("/countdowns/{}", updated.id))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
@@ -340,13 +359,24 @@ repeat = "workday"
         // GET 404
         let res = router
             .clone()
-            .oneshot(Request::get("/countdowns/does-not-exist").body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/countdowns/does-not-exist")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
-        #[derive(serde::Deserialize)] struct TestErr { error: TestErrInner }
-        #[derive(serde::Deserialize)] struct TestErrInner { code: String, message: String }
+        #[derive(serde::Deserialize)]
+        struct TestErr {
+            error: TestErrInner,
+        }
+        #[derive(serde::Deserialize)]
+        struct TestErrInner {
+            code: String,
+            message: String,
+        }
         let body: TestErr = serde_json::from_slice(&bytes).unwrap();
         let _ = &body.error.message;
         assert_eq!(body.error.code, "not_found");
@@ -354,7 +384,12 @@ repeat = "workday"
         let bad = serde_json::json!({"title":"X","datetime":"BAD","enabled":true});
         let res = router
             .clone()
-            .oneshot(Request::post("/countdowns").header("content-type","application/json").body(axum::body::Body::from(serde_json::to_vec(&bad).unwrap())).unwrap())
+            .oneshot(
+                Request::post("/countdowns")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&bad).unwrap()))
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
@@ -366,7 +401,12 @@ repeat = "workday"
         let bad = serde_json::json!({"title":"X","datetime":"2026-01-01 00:00:00","repeat":"x"});
         let res = router
             .clone()
-            .oneshot(Request::post("/countdowns").header("content-type","application/json").body(axum::body::Body::from(serde_json::to_vec(&bad).unwrap())).unwrap())
+            .oneshot(
+                Request::post("/countdowns")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&bad).unwrap()))
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
@@ -378,7 +418,12 @@ repeat = "workday"
         let bad = serde_json::json!({"title":"","datetime":"2026-01-01 00:00:00"});
         let res = router
             .clone()
-            .oneshot(Request::post("/countdowns").header("content-type","application/json").body(axum::body::Body::from(serde_json::to_vec(&bad).unwrap())).unwrap())
+            .oneshot(
+                Request::post("/countdowns")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&bad).unwrap()))
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
@@ -390,7 +435,12 @@ repeat = "workday"
         let good = serde_json::json!({"title":"X","datetime":"2026-01-01 00:00:00"});
         let res = router
             .clone()
-            .oneshot(Request::put("/countdowns/nope").header("content-type","application/json").body(axum::body::Body::from(serde_json::to_vec(&good).unwrap())).unwrap())
+            .oneshot(
+                Request::put("/countdowns/nope")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&good).unwrap()))
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
@@ -401,7 +451,11 @@ repeat = "workday"
         // DELETE 404
         let res = router
             .clone()
-            .oneshot(Request::delete("/countdowns/nope").body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::delete("/countdowns/nope")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
@@ -430,7 +484,11 @@ repeat = "workday"
         // Ensure GET returns items with id
         let res = router
             .clone()
-            .oneshot(Request::get("/countdowns").body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/countdowns")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
@@ -460,13 +518,20 @@ datetime = "2026-10-11 10:20:30"
         assert!(store.reload_if_changed().await.unwrap());
         // list should contain C with id
         let res = router
-            .oneshot(Request::get("/countdowns").body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/countdowns")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
         let list: Vec<ApiCountdown> = serde_json::from_slice(&bytes).unwrap();
-        let item = list.iter().find(|it| it.title == "C").expect("new item exists");
+        let item = list
+            .iter()
+            .find(|it| it.title == "C")
+            .expect("new item exists");
         assert!(!item.id.is_empty());
         let on_disk = fs::read_to_string(&path).unwrap();
         assert!(on_disk.contains(&format!("id = \"{}\"", item.id)));
@@ -550,11 +615,14 @@ datetime = "2026-12-31 00:00:00"
         assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
         #[derive(serde::Deserialize)]
-        struct E { error: Code }
+        struct E {
+            error: Code,
+        }
         #[derive(serde::Deserialize)]
-        struct Code { code: String }
+        struct Code {
+            code: String,
+        }
         let e: E = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(e.error.code, "internal");
     }
 }
-
