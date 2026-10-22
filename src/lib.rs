@@ -39,7 +39,7 @@ impl<'de> de::Deserialize<'de> for RepeatMode {
     }
 }
 
-pub trait HotReload {
+pub(crate) trait HotReload {
     async fn reload(&mut self) -> Result<(), Box<dyn std::error::Error>>;
 }
 
