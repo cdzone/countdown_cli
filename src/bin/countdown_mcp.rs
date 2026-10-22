@@ -86,7 +86,12 @@ impl CountdownMcp {
     fn new(api_url: reqwest::Url) -> Self {
         Self {
             api_url,
-            http: reqwest::Client::new(),
+            // The API is local; ignore HTTP_PROXY and friends so a proxy
+            // configured for the shell cannot make it look unreachable.
+            http: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("build HTTP client"),
         }
     }
 
