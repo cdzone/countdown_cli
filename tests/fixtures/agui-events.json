@@ -1,0 +1,56 @@
+{
+  "source": "@ag-ui/core@1.0.3 (schemas)",
+  "generated_by": "cd web && npm ci && npm run gen-fixtures",
+  "events": [
+    {
+      "type": "RUN_STARTED",
+      "threadId": "t1",
+      "runId": "r1"
+    },
+    {
+      "type": "RUN_FINISHED",
+      "threadId": "t1",
+      "runId": "r1"
+    },
+    {
+      "type": "RUN_ERROR",
+      "message": "模型网关出错",
+      "code": "model_error"
+    },
+    {
+      "type": "TEXT_MESSAGE_START",
+      "messageId": "m1",
+      "role": "assistant"
+    },
+    {
+      "type": "TEXT_MESSAGE_CONTENT",
+      "messageId": "m1",
+      "delta": "答案"
+    },
+    {
+      "type": "TEXT_MESSAGE_END",
+      "messageId": "m1"
+    },
+    {
+      "type": "TOOL_CALL_START",
+      "toolCallId": "c1",
+      "toolCallName": "list_countdowns"
+    },
+    {
+      "type": "TOOL_CALL_ARGS",
+      "toolCallId": "c1",
+      "delta": "{}"
+    },
+    {
+      "type": "TOOL_CALL_END",
+      "toolCallId": "c1"
+    },
+    {
+      "type": "TOOL_CALL_RESULT",
+      "messageId": "m2",
+      "toolCallId": "c1",
+      "content": "{\"ok\":true}",
+      "role": "tool"
+    }
+  ]
+}

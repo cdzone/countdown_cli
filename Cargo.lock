@@ -368,6 +368,7 @@ dependencies = [
  "tempfile",
  "tikv-jemallocator",
  "tokio",
+ "tokio-stream",
  "toml",
  "toml_edit",
  "tower",
