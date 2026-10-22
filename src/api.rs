@@ -442,6 +442,8 @@ repeat = "workday"
     #[tokio::test]
     async fn manual_append_then_hot_reload_makes_new_item_visible_with_id() {
         let (router, store, _dir, path) = setup_router_with_file(&sample_toml()).await;
+        // 文件修改时间有粒度：先等一下，保证手改后的 mtime 和启动时不同
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         // append one item manually (no id)
         {
             let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
@@ -455,9 +457,7 @@ datetime = "2026-10-11 10:20:30"
             )
             .unwrap();
         }
-        // simulate hot reload (ensure mtime difference)
-        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
-        store.reload().await.unwrap();
+        assert!(store.reload_if_changed().await.unwrap());
         // list should contain C with id
         let res = router
             .oneshot(Request::get("/countdowns").body(axum::body::Body::empty()).unwrap())
@@ -468,6 +468,8 @@ datetime = "2026-10-11 10:20:30"
         let list: Vec<ApiCountdown> = serde_json::from_slice(&bytes).unwrap();
         let item = list.iter().find(|it| it.title == "C").expect("new item exists");
         assert!(!item.id.is_empty());
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains(&format!("id = \"{}\"", item.id)));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
