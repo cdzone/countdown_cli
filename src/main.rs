@@ -1,7 +1,7 @@
 use chrono::{Local, NaiveDateTime};
 use clap::Parser;
 use colored::*;
-use countdown_cli::{calculate_target_time, CountDownConfig};
+use countdown_cli::{calculate_target_time, CountdownStore};
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{cursor, ExecutableCommand};
 use notify::{osx_terminal_notifier, probe_terminal_notifier};
@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 mod notify;
+mod api;
 
 pub fn get_styles() -> clap::builder::Styles {
     use clap::builder::styling::*;
@@ -47,6 +48,8 @@ struct CliArgs {
         help = "Set long break interval (number of work sessions)"
     )]
     long_break_interval: Option<u32>,
+    #[arg(long = "api", help = "Bind HTTP API on loopback address (e.g. 127.0.0.1:8080)")]
+    api: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -169,7 +172,7 @@ impl PomodoroTimer {
 #[allow(unused_assignments)]
 async fn terminal_run(
     if_running: Arc<AtomicBool>,
-    config: CountDownConfig,
+    store: Arc<CountdownStore>,
     notify_sound: Option<String>,
     cli_args: Option<&CliArgs>,
 ) {
@@ -235,15 +238,18 @@ async fn terminal_run(
         }
 
         let now = Local::now().naive_local();
-        let mut target_datetimes: Vec<(String, NaiveDateTime)> = config
-            .get_config()
-            .await
+        let data_guard = store.read_data().await;
+        let mut target_datetimes: Vec<(String, NaiveDateTime, Option<String>)> = data_guard
             .countdown
-            .into_iter()
+            .iter()
             .filter(|countdown| countdown.enabled)
             .filter_map(|countdown| {
                 match calculate_target_time(&countdown.datetime, countdown.repeat.as_ref(), now) {
-                    Some(datetime) => Some((countdown.title.clone(), datetime)),
+                    Some(datetime) => Some((
+                        countdown.title.clone(),
+                        datetime,
+                        countdown.id.clone(),
+                    )),
                     None => {
                         println!(
                             "错误：'{}' 的日期时间格式无效。请使用 'YYYY-MM-DD HH:MM:SS' 格式。",
@@ -332,12 +338,11 @@ async fn terminal_run(
         current_line_count += 1;
         drop(pomodoro_lock);
 
-        for (title, target_datetime) in target_datetimes.iter() {
+        for (title, target_datetime, id_opt) in target_datetimes.iter() {
             let remaining = *target_datetime - now;
             let remaining_seconds = remaining.num_seconds();
-            if remaining_seconds != 0 {
-                notified_at_zero.remove(title);
-            }
+            let notify_now =
+                should_notify(&mut notified_at_zero, id_opt.as_deref(), title, remaining_seconds);
 
             let message = match remaining_seconds {
                 86401_i64..=i64::MAX => {
@@ -369,7 +374,7 @@ async fn terminal_run(
                     )
                 }
                 0 => {
-                    if notified_at_zero.insert(title.clone()) {
+                    if notify_now {
                         let _ =
                             osx_terminal_notifier(title, "时间到了", notify_sound.clone()).await;
                     }
@@ -393,6 +398,21 @@ async fn terminal_run(
 
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// 到点只通知一次：按 id 去重（没有 id 时退化为 title），离开 0 秒后清掉记录。
+fn should_notify(
+    notified: &mut HashSet<String>,
+    id: Option<&str>,
+    title: &str,
+    remaining_seconds: i64,
+) -> bool {
+    let key = id.unwrap_or(title).to_string();
+    if remaining_seconds != 0 {
+        notified.remove(&key);
+        return false;
+    }
+    notified.insert(key)
 }
 
 fn handle_user_input(tx: std_mpsc::Sender<String>, if_running: Arc<AtomicBool>) {
@@ -435,7 +455,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let file_path = cli_args.config_file.clone();
     let notify_sound = cli_args.notify_sound.clone();
 
-    let config = CountDownConfig::try_new(file_path).unwrap();
+    // 先校验并绑定 API 地址，再读配置：被拒的启动不能改动用户文件
+    let api_listener = match &cli_args.api {
+        Some(addr_s) => {
+            let addr: std::net::SocketAddr = addr_s
+                .parse()
+                .map_err(|_| "--api 仅接受形如 127.0.0.1:PORT 或 [::1]:PORT 的地址".to_string())?;
+            if !addr.ip().is_loopback() {
+                eprintln!("错误：--api 只允许绑定回环地址（127.0.0.1 / ::1）");
+                std::process::exit(2);
+            }
+            Some(tokio::net::TcpListener::bind(addr).await?)
+        }
+        None => None,
+    };
+    let store = CountdownStore::new(file_path, api_listener.is_some()).await?;
 
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -444,13 +478,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
     .expect("Error setting Ctrl-C handler");
 
-    let config_for_spawn = config.clone();
+    let store_for_spawn = store.clone();
     let if_running_for_spawn = running.clone();
     let notify_sound_for_spawn = notify_sound.clone();
     let countdown_handle = tokio::spawn(async move {
         terminal_run(
             if_running_for_spawn,
-            config_for_spawn,
+            store_for_spawn,
             notify_sound_for_spawn,
             Some(&cli_args),
         )
@@ -460,14 +494,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("警告: {msg}");
     }
 
-    let mut config_for_reload = config.clone();
+    let store_for_reload = store.clone();
     let _reload_handle = tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
             // Cheap metadata check; only re-parse TOML when mtime changes.
-            let _ = config_for_reload.reload_if_changed().await;
+            let _ = store_for_reload.reload_if_changed().await;
         }
     });
+
+    // 启动HTTP API（仅接受回环地址）
+    if let Some(listener) = api_listener {
+        let router = api::build_router(store.clone());
+        // 不写stdout；axum默认不输出日志
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, router).await {
+                eprintln!("API server error: {e}");
+            }
+        });
+    }
 
     countdown_handle.await?;
 
@@ -530,5 +575,20 @@ mod pomodoro_interval_tests {
         t.set_state(PomodoroState::Work);
         t.next_state();
         assert_eq!(t.state, PomodoroState::LongBreak);
+    }
+}
+
+#[cfg(test)]
+mod notify_dedup_tests {
+    use super::*;
+
+    #[test]
+    fn same_title_reminders_due_together_both_notify_once() {
+        let mut notified = HashSet::new();
+        assert!(should_notify(&mut notified, Some("id-1"), "A", 0));
+        assert!(should_notify(&mut notified, Some("id-2"), "A", 0));
+        // 下一帧仍是 0 秒：不重复通知
+        assert!(!should_notify(&mut notified, Some("id-1"), "A", 0));
+        assert!(!should_notify(&mut notified, Some("id-2"), "A", 0));
     }
 }
