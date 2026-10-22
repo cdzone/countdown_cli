@@ -21,6 +21,7 @@ impl fmt::Display for RepeatMode {
         }
     }
 }
+
 impl<'de> de::Deserialize<'de> for RepeatMode {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
