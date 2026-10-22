@@ -12,6 +12,7 @@ pub enum RepeatMode {
     /// Repeats every weekday (Monday to Friday)
     Weekday,
 }
+
 impl fmt::Display for RepeatMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -20,7 +21,6 @@ impl fmt::Display for RepeatMode {
         }
     }
 }
-
 impl<'de> de::Deserialize<'de> for RepeatMode {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
