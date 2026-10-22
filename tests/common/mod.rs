@@ -15,6 +15,22 @@ use std::{
 use serde_json::{json, Value};
 
 pub const SERVICE_TOKEN: &str = "svc-token-0123456789abcdef0123456789abcdef";
+/// Entry token of the MCP caller `agent-dev`, in every spawned server's table.
+pub const CALLER_TOKEN: &str = "caller-token-0123456789abcdef0123456789abcd";
+pub const CALLER_ID: &str = "agent-dev";
+
+pub fn caller_auth() -> String {
+    format!("Bearer {CALLER_TOKEN}")
+}
+
+/// Parses a JSON Lines audit file; a missing file has no lines.
+pub fn read_audit(path: &Path) -> Vec<Value> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("each audit line is JSON"))
+        .collect()
+}
 
 /// Upper bound for one HTTP request in tests: a server that accepts the
 /// connection but never answers must fail the test, not hang CI.
@@ -133,6 +149,9 @@ pub struct McpProcess {
     stderr: Arc<Mutex<String>>,
     reader: Option<JoinHandle<()>>,
     pub port: u16,
+    /// Default entry token table and audit log (env; `extra` args override).
+    pub dir: tempfile::TempDir,
+    pub audit: PathBuf,
 }
 
 impl McpProcess {
@@ -143,10 +162,20 @@ impl McpProcess {
         extra: impl FnOnce(&mut Command),
     ) -> Self {
         let port = free_port();
+        let dir = tempfile::tempdir().unwrap();
+        let tokens = dir.path().join("mcp-tokens.toml");
+        std::fs::write(
+            &tokens,
+            token_table(&[(CALLER_ID, CALLER_TOKEN, "countdowns:read")]),
+        )
+        .unwrap();
+        let audit = dir.path().join("mcp-audit.jsonl");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_countdown_mcp"));
         cmd.args(["--api-url", api_url])
             .args(["--addr", &format!("127.0.0.1:{port}")])
             .env_remove("COUNTDOWN_API_TOKEN_FILE")
+            .env("COUNTDOWN_MCP_TOKENS", &tokens)
+            .env("COUNTDOWN_MCP_AUDIT_LOG", &audit)
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         if let Some(path) = token_file {
@@ -170,6 +199,8 @@ impl McpProcess {
             stderr,
             reader: Some(reader),
             port,
+            dir,
+            audit,
         }
     }
 
@@ -179,6 +210,10 @@ impl McpProcess {
 
     pub fn stderr(&self) -> String {
         self.stderr.lock().unwrap().clone()
+    }
+
+    pub fn audit_lines(&self) -> Vec<Value> {
+        read_audit(&self.audit)
     }
 
     /// Waits until stderr contains `needle`.

@@ -14,6 +14,15 @@ use std::{
 
 use serde::Serialize;
 
+/// Cap, in characters, for caller-supplied strings copied into audit lines.
+pub const MAX_AUDIT_STR: usize = 64;
+
+/// The first `MAX_AUDIT_STR` characters of `s`; cuts on char boundaries, so
+/// multi-byte UTF-8 is never split.
+pub fn truncated(s: &str) -> String {
+    s.chars().take(MAX_AUDIT_STR).collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct AuditLog {
     path: PathBuf,
@@ -49,6 +58,17 @@ impl AuditLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncated_keeps_first_64_chars_on_char_boundaries() {
+        assert_eq!(truncated("short"), "short");
+        let ascii = "a".repeat(100);
+        assert_eq!(truncated(&ascii), "a".repeat(64));
+        let wide = "倒".repeat(70);
+        let cut = truncated(&wide);
+        assert_eq!(cut.chars().count(), 64);
+        assert_eq!(cut, "倒".repeat(64));
+    }
     use serde_json::{json, Value};
 
     fn lines(path: &Path) -> Vec<Value> {

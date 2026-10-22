@@ -4,10 +4,26 @@
 //! Every API request carries this server's own service token (never the MCP
 //! caller's), a fresh `X-Request-Id`, and the caller id when one is known.
 
-use std::{fmt, net::SocketAddr, path::Path, path::PathBuf, time::Duration};
+use std::{
+    fmt,
+    net::SocketAddr,
+    path::Path,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use axum::http::{request::Parts, HeaderValue};
+use axum::{
+    extract::{Request, State},
+    http::{header, request::Parts, HeaderMap, HeaderValue, StatusCode},
+    middleware::Next,
+    response::{IntoResponse, Response},
+};
 use clap::Parser;
+use countdown_cli::{
+    audit::{truncated, AuditLog},
+    auth::{bearer_challenge, TokenTable},
+};
 use rmcp::{
     handler::server::{tool::Extension, wrapper::Parameters},
     model::*,
@@ -44,6 +60,16 @@ struct Args {
     /// (one line; on Unix it must not be readable by group or others)
     #[arg(long, env = "COUNTDOWN_API_TOKEN_FILE")]
     api_token_file: PathBuf,
+    /// Token table (SHA-256 digests) for callers of /mcp
+    #[arg(long, env = "COUNTDOWN_MCP_TOKENS")]
+    tokens: PathBuf,
+    /// Audit log, JSON Lines, mode 0600; never stderr
+    #[arg(
+        long,
+        env = "COUNTDOWN_MCP_AUDIT_LOG",
+        default_value = "countdown-mcp-audit.jsonl"
+    )]
+    audit_log: PathBuf,
 }
 
 /// `Authorization: Bearer <token>` for the API, marked sensitive.
@@ -126,32 +152,96 @@ impl ServiceToken {
         value.set_sensitive(true);
         Ok(ServiceToken(value))
     }
+
+    /// The bare token, for the audience check against the entry table.
+    fn plaintext(&self) -> &str {
+        self.0
+            .to_str()
+            .ok()
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .unwrap_or("")
+    }
 }
 
-/// Id of the authenticated MCP caller. The `/mcp` entry middleware puts it
-/// into the request extensions; until that exists no caller is forwarded.
+/// Id of the authenticated MCP caller, put into the request extensions by
+/// the `/mcp` entry middleware and forwarded as `X-Countdown-Caller`.
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // only tests construct it until the middleware lands
 struct Caller(String);
 
-#[derive(Serialize, Clone, Copy)]
+#[derive(Serialize, Clone, Copy, Debug, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum Outcome {
+    Ok,
+    Unauthenticated,
+    Forbidden,
+    NotFound,
     UpstreamAuthFailed,
     UpstreamUnreachable,
     Error,
 }
 
-/// One upstream request, correlated with the API side by `request_id`.
+/// One audit record (spec 5.1). Only structured fields; no headers or bodies.
+#[derive(Serialize)]
+struct Record<'a> {
+    ts: String,
+    svc: &'static str,
+    request_id: &'a str,
+    caller: Option<&'a str>,
+    on_behalf_of: Option<&'a str>,
+    action: &'a str,
+    target: Option<&'a str>,
+    params: &'a serde_json::Value,
+    outcome: Outcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth_fail: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    is_error: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream_status: Option<u16>,
+    duration_ms: u64,
+}
+
+fn now_rfc3339() -> String {
+    chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, false)
+}
+
+/// Writes `record`; if the file cannot be written, stderr is the only fallback.
+fn write_audit(audit: &AuditLog, record: &Record<'_>) {
+    if let Err(e) = audit.append(record) {
+        eprintln!(
+            "audit log unavailable ({e}); lost record request_id={} action={}",
+            record.request_id, record.action
+        );
+    }
+}
+
+/// Why an upstream request did not produce a result.
+struct Failure {
+    outcome: Outcome,
+    upstream_status: Option<reqwest::StatusCode>,
+    message: String,
+}
+
+/// One tool call (or the startup probe), correlated with the API side by
+/// `request_id`. Exactly one audit record is written per call.
 struct Upstream {
     request_id: String,
     caller: Option<String>,
     action: &'static str,
     target: Option<String>,
+    params: serde_json::Value,
+    started: Instant,
 }
 
 impl Upstream {
-    fn new(action: &'static str, parts: Option<&Parts>, target: Option<&str>) -> Self {
+    fn new(
+        action: &'static str,
+        parts: Option<&Parts>,
+        target: Option<&str>,
+        params: serde_json::Value,
+    ) -> Self {
         Self {
             request_id: uuid::Uuid::new_v4().to_string(),
             caller: parts
@@ -159,38 +249,211 @@ impl Upstream {
                 .map(|c| c.0.clone()),
             action,
             target: target.map(str::to_owned),
+            params,
+            started: Instant::now(),
         }
     }
 
-    /// One JSON line on stderr, same shape as the audit records.
-    fn report(&self, outcome: Outcome, upstream_status: Option<reqwest::StatusCode>) {
-        #[derive(Serialize)]
-        struct Line<'a> {
-            ts: String,
-            svc: &'static str,
-            request_id: &'a str,
-            caller: Option<&'a str>,
-            action: &'a str,
-            target: Option<&'a str>,
-            outcome: Outcome,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            upstream_status: Option<u16>,
-        }
-        let line = Line {
-            ts: chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, false),
-            svc: "mcp",
-            request_id: &self.request_id,
-            caller: self.caller.as_deref(),
-            action: self.action,
-            target: self.target.as_deref(),
-            outcome,
-            upstream_status: upstream_status.map(|s| s.as_u16()),
-        };
-        eprintln!(
-            "{}",
-            serde_json::to_string(&line).expect("log line serializes")
+    fn record(
+        &self,
+        audit: &AuditLog,
+        outcome: Outcome,
+        is_error: Option<bool>,
+        upstream_status: Option<reqwest::StatusCode>,
+    ) {
+        write_audit(
+            audit,
+            &Record {
+                ts: now_rfc3339(),
+                svc: "mcp",
+                request_id: &self.request_id,
+                caller: self.caller.as_deref(),
+                on_behalf_of: None,
+                action: self.action,
+                target: self.target.as_deref(),
+                params: &self.params,
+                outcome,
+                auth_fail: None,
+                status: None,
+                is_error,
+                upstream_status: upstream_status.map(|s| s.as_u16()),
+                duration_ms: self.started.elapsed().as_millis() as u64,
+            },
         );
     }
+
+    /// Audits the finished tool call and tags the result with `request_id`
+    /// in `_meta`, so a client can quote it when reporting a problem.
+    fn finish(
+        &self,
+        audit: &AuditLog,
+        result: Result<CallToolResult, Failure>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut result = match result {
+            Ok(r) => {
+                self.record(audit, Outcome::Ok, Some(false), None);
+                r
+            }
+            Err(f) => {
+                self.record(audit, f.outcome, Some(true), f.upstream_status);
+                tool_error(f.message)
+            }
+        };
+        let mut meta = serde_json::Map::new();
+        meta.insert("request_id".into(), self.request_id.clone().into());
+        result.meta = Some(MetaObject(meta));
+        Ok(result)
+    }
+}
+
+/// Why the `/mcp` entry rejected a request (spec 6.2; same rules as the API).
+enum AuthFail {
+    Missing,
+    Malformed { bearer: bool },
+    UnknownToken,
+}
+
+impl AuthFail {
+    fn audit_name(&self) -> &'static str {
+        match self {
+            AuthFail::Missing => "missing",
+            AuthFail::Malformed { .. } => "malformed",
+            AuthFail::UnknownToken => "unknown_token",
+        }
+    }
+
+    /// 401 per RFC 6750: `error=` only when a bearer token was presented.
+    /// MCP has no scopes in step 4, so no `scope=` hint.
+    fn response(&self) -> Response {
+        let invalid_token = match self {
+            AuthFail::Missing => false,
+            AuthFail::Malformed { bearer } => *bearer,
+            AuthFail::UnknownToken => true,
+        };
+        (
+            StatusCode::UNAUTHORIZED,
+            [(
+                header::WWW_AUTHENTICATE,
+                bearer_challenge(invalid_token, None),
+            )],
+        )
+            .into_response()
+    }
+}
+
+/// Only the first `Authorization` header counts, as on the API side.
+fn authenticate(tokens: &TokenTable, headers: &HeaderMap) -> Result<String, AuthFail> {
+    let value = headers
+        .get(header::AUTHORIZATION)
+        .ok_or(AuthFail::Missing)?
+        .to_str()
+        .map_err(|_| AuthFail::Malformed { bearer: false })?;
+    let (scheme, token) = value.split_once(' ').unwrap_or((value, ""));
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return Err(AuthFail::Malformed { bearer: false });
+    }
+    match token.trim() {
+        "" => Err(AuthFail::Malformed { bearer: true }),
+        token => tokens
+            .lookup(token)
+            .map(|p| p.id().to_owned())
+            .ok_or(AuthFail::UnknownToken),
+    }
+}
+
+/// State of the `/mcp` entry middleware.
+struct Entry {
+    tokens: TokenTable,
+    audit: AuditLog,
+}
+
+impl Entry {
+    fn record(
+        &self,
+        action: &str,
+        caller: Option<&str>,
+        outcome: Outcome,
+        auth_fail: &'static str,
+        status: StatusCode,
+        started: Instant,
+    ) {
+        write_audit(
+            &self.audit,
+            &Record {
+                ts: now_rfc3339(),
+                svc: "mcp",
+                request_id: &uuid::Uuid::new_v4().to_string(),
+                caller,
+                on_behalf_of: None,
+                action,
+                target: None,
+                params: &serde_json::Value::Null,
+                outcome,
+                auth_fail: Some(auth_fail),
+                status: Some(status.as_u16()),
+                is_error: None,
+                upstream_status: None,
+                duration_ms: started.elapsed().as_millis() as u64,
+            },
+        );
+    }
+}
+
+/// Authenticates every request before rmcp sees it (installed with
+/// `Router::layer`, so unknown paths are covered too). A bad `Origin` is
+/// refused by rmcp's allow-list; this layer only audits that 403.
+async fn entry_guard(State(entry): State<Arc<Entry>>, mut req: Request, next: Next) -> Response {
+    let started = Instant::now();
+    // The path is client-chosen (unknown paths land here too): cap it.
+    let action = format!("http:{} {}", req.method(), truncated(req.uri().path()));
+    let has_origin = req.headers().contains_key(header::ORIGIN);
+    let caller = match authenticate(&entry.tokens, req.headers()) {
+        Ok(caller) => caller,
+        Err(fail) => {
+            entry.record(
+                &action,
+                None,
+                Outcome::Unauthenticated,
+                fail.audit_name(),
+                StatusCode::UNAUTHORIZED,
+                started,
+            );
+            return fail.response();
+        }
+    };
+    req.extensions_mut().insert(Caller(caller.clone()));
+    let resp = next.run(req).await;
+    if resp.status() == StatusCode::FORBIDDEN && has_origin {
+        entry.record(
+            &action,
+            Some(&caller),
+            Outcome::Forbidden,
+            "bad_origin",
+            StatusCode::FORBIDDEN,
+            started,
+        );
+    }
+    resp
+}
+
+/// Origins allowed on `/mcp` (spec 3.3a): the server's own loopback names.
+fn allowed_origins(port: u16) -> [String; 2] {
+    [
+        format!("http://127.0.0.1:{port}"),
+        format!("http://localhost:{port}"),
+    ]
+}
+
+/// The app served on the MCP address: rmcp under `/mcp`, behind the guard.
+fn app(mcp: CountdownMcp, entry: Arc<Entry>, port: u16) -> axum::Router {
+    let service = StreamableHttpService::new(
+        move || Ok(mcp.clone()),
+        LocalSessionManager::default().into(),
+        StreamableHttpServerConfig::default().with_allowed_origins(allowed_origins(port)),
+    );
+    axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(axum::middleware::from_fn_with_state(entry, entry_guard))
 }
 
 fn rejected_credential(status: reqwest::StatusCode) -> String {
@@ -230,6 +493,7 @@ struct GetArgs {
 struct CountdownMcp {
     api_url: reqwest::Url,
     http: reqwest::Client,
+    audit: AuditLog,
 }
 
 fn tool_error(msg: String) -> CallToolResult {
@@ -256,7 +520,7 @@ enum Probe {
 
 #[tool_router]
 impl CountdownMcp {
-    fn new(api_url: reqwest::Url, token: &ServiceToken) -> Self {
+    fn new(api_url: reqwest::Url, token: &ServiceToken, audit: AuditLog) -> Self {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(reqwest::header::AUTHORIZATION, token.0.clone());
         Self {
@@ -268,6 +532,7 @@ impl CountdownMcp {
                 .default_headers(headers)
                 .build()
                 .expect("build HTTP client"),
+            audit,
         }
     }
 
@@ -295,52 +560,75 @@ impl CountdownMcp {
         &self,
         url: reqwest::Url,
         up: &Upstream,
-    ) -> Result<T, String> {
+    ) -> Result<T, Failure> {
+        let fail = |outcome, upstream_status, message| Failure {
+            outcome,
+            upstream_status,
+            message,
+        };
         let resp = self.get(url.clone(), up).send().await.map_err(|e| {
-            up.report(Outcome::UpstreamUnreachable, None);
-            format!("countdown API unreachable at {url}: {e}")
+            fail(
+                Outcome::UpstreamUnreachable,
+                None,
+                format!("countdown API unreachable at {url}: {e}"),
+            )
         })?;
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_FOUND {
-            return Err("countdown not found".to_string());
+            return Err(fail(
+                Outcome::NotFound,
+                Some(status),
+                "countdown not found".to_string(),
+            ));
         }
         // The API's body is not passed on: it is not meant for the model.
         if matches!(
             status,
             reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
         ) {
-            up.report(Outcome::UpstreamAuthFailed, Some(status));
-            return Err(rejected_credential(status));
+            return Err(fail(
+                Outcome::UpstreamAuthFailed,
+                Some(status),
+                rejected_credential(status),
+            ));
         }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("countdown API returned {status}: {body}"));
+            return Err(fail(
+                Outcome::Error,
+                Some(status),
+                format!("countdown API returned {status}: {body}"),
+            ));
         }
-        resp.json::<T>()
-            .await
-            .map_err(|e| format!("countdown API returned an unexpected body: {e}"))
+        resp.json::<T>().await.map_err(|e| {
+            fail(
+                Outcome::Error,
+                Some(status),
+                format!("countdown API returned an unexpected body: {e}"),
+            )
+        })
     }
 
     /// Checks the service token once at startup. An unreachable API is only
-    /// reported, since it may start after this server.
+    /// audited, since it may start after this server.
     async fn probe(&self) -> Probe {
-        let up = Upstream::new("probe:GET /countdowns", None, None);
+        let up = Upstream::new("probe:GET /countdowns", None, None, serde_json::Value::Null);
         let mut url = self.endpoint(&["countdowns"]);
         url.query_pairs_mut().append_pair("enabled", "true");
         let status = match self.get(url, &up).timeout(PROBE_TIMEOUT).send().await {
             Ok(resp) => resp.status(),
             Err(_) => {
-                up.report(Outcome::UpstreamUnreachable, None);
+                up.record(&self.audit, Outcome::UpstreamUnreachable, None, None);
                 return Probe::Accepted;
             }
         };
         match status {
             reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
-                up.report(Outcome::UpstreamAuthFailed, Some(status));
+                up.record(&self.audit, Outcome::UpstreamAuthFailed, None, Some(status));
                 Probe::Rejected(status)
             }
             s if !s.is_success() => {
-                up.report(Outcome::Error, Some(s));
+                up.record(&self.audit, Outcome::Error, None, Some(s));
                 Probe::Accepted
             }
             _ => Probe::Accepted,
@@ -355,20 +643,30 @@ impl CountdownMcp {
         Parameters(args): Parameters<ListArgs>,
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
-        let up = Upstream::new("tool:list_countdowns", Some(&parts), None);
+        let params = serde_json::json!({
+            "within_hours": args.within_hours,
+            "include_disabled": args.include_disabled,
+        });
+        let up = Upstream::new("tool:list_countdowns", Some(&parts), None, params);
         let mut url = self.endpoint(&["countdowns"]);
         if !args.include_disabled {
             url.query_pairs_mut().append_pair("enabled", "true");
         }
-        let items: Vec<Countdown> = match self.fetch(url, &up).await {
-            Ok(items) => items,
-            Err(msg) => return Ok(tool_error(msg)),
-        };
-        let items: Vec<Countdown> = match args.within_hours {
-            Some(h) => items.into_iter().filter(|c| due_within(c, h)).collect(),
-            None => items,
-        };
-        json_result(&items)
+        let result = self
+            .fetch::<Vec<Countdown>>(url, &up)
+            .await
+            .and_then(|items| {
+                let items: Vec<Countdown> = match args.within_hours {
+                    Some(h) => items.into_iter().filter(|c| due_within(c, h)).collect(),
+                    None => items,
+                };
+                json_result(&items).map_err(|e| Failure {
+                    outcome: Outcome::Error,
+                    upstream_status: None,
+                    message: e.message.to_string(),
+                })
+            });
+        up.finish(&self.audit, result)
     }
 
     #[tool(
@@ -379,17 +677,25 @@ impl CountdownMcp {
         Parameters(GetArgs { id }): Parameters<GetArgs>,
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
-        let up = Upstream::new("tool:get_countdown", Some(&parts), Some(&id));
-        match self
+        let params = serde_json::json!({ "id": id });
+        let up = Upstream::new("tool:get_countdown", Some(&parts), Some(&id), params);
+        let result = match self
             .fetch::<Countdown>(self.endpoint(&["countdowns", &id]), &up)
             .await
         {
-            Ok(item) => json_result(&item),
-            Err(msg) => Ok(tool_error(format!("{msg} (id: {id})"))),
-        }
+            Ok(item) => json_result(&item).map_err(|e| Failure {
+                outcome: Outcome::Error,
+                upstream_status: None,
+                message: e.message.to_string(),
+            }),
+            Err(mut f) => {
+                f.message = format!("{} (id: {id})", f.message);
+                Err(f)
+            }
+        };
+        up.finish(&self.audit, result)
     }
 }
-
 #[tool_handler]
 impl ServerHandler for CountdownMcp {
     fn get_info(&self) -> ServerConfig {
@@ -411,6 +717,13 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let tokens = match TokenTable::load(&args.tokens) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("--tokens {}: {e}", args.tokens.display());
+            std::process::exit(2);
+        }
+    };
     let token = match ServiceToken::load(&args.api_token_file) {
         Ok(token) => token,
         Err(e) => {
@@ -418,17 +731,25 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    let mcp = CountdownMcp::new(args.api_url, &token);
+    // Audience isolation (spec 3.2): the API credential must not open /mcp.
+    if tokens.lookup(token.plaintext()).is_some() {
+        eprintln!("the API service token must not also be an MCP entry token (--tokens)");
+        std::process::exit(2);
+    }
+    let audit = match AuditLog::open(&args.audit_log) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("--audit-log {}: {e}", args.audit_log.display());
+            std::process::exit(2);
+        }
+    };
+    let mcp = CountdownMcp::new(args.api_url, &token, audit.clone());
     if let Probe::Rejected(status) = mcp.probe().await {
         eprintln!("{}; check --api-token-file", rejected_credential(status));
         std::process::exit(2);
     }
-    let service = StreamableHttpService::new(
-        move || Ok(mcp.clone()),
-        LocalSessionManager::default().into(),
-        StreamableHttpServerConfig::default(),
-    );
-    let router = axum::Router::new().nest_service("/mcp", service);
+    let entry = Arc::new(Entry { tokens, audit });
+    let router = app(mcp, entry, args.addr.port());
     eprintln!("countdown_mcp listening on http://{}/mcp", args.addr);
     if let Err(e) = axum::serve(listener, router).await {
         eprintln!("server error: {e}");
@@ -536,9 +857,11 @@ mod tests {
     const SERVICE_TOKEN: &str = "svc-token-0123456789abcdef0123456789abcdef";
 
     fn mcp(api_url: reqwest::Url) -> CountdownMcp {
+        let path = std::env::temp_dir().join(format!("mcp-unit-{}.jsonl", uuid::Uuid::new_v4()));
         CountdownMcp::new(
             api_url,
             &ServiceToken::parse(SERVICE_TOKEN.as_bytes()).unwrap(),
+            AuditLog::open(&path).unwrap(),
         )
     }
 

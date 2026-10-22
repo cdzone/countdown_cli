@@ -11,7 +11,7 @@ use axum::{
 };
 use chrono::{Local, NaiveDateTime};
 use countdown_cli::{
-    audit::AuditLog,
+    audit::{truncated, AuditLog},
     auth::{bearer_challenge, Principal, Scope, TokenTable},
     CountdownUpdateError,
 };
@@ -129,8 +129,6 @@ const X_COUNTDOWN_CALLER: &str = "x-countdown-caller";
 const X_AUDIT_STATUS: &str = "x-audit-status";
 /// Same cap axum's `Json` extractor applies by default.
 const MAX_BODY: usize = 2 * 1024 * 1024;
-/// Cap for caller-supplied strings copied into audit lines.
-const MAX_AUDIT_STR: usize = 64;
 /// Body fields whose presence is recorded; values never are.
 const WRITE_FIELDS: [&str; 4] = ["title", "datetime", "enabled", "repeat"];
 
@@ -229,10 +227,6 @@ fn with_challenge(mut res: Response, challenge: String) -> Response {
         res.headers_mut().insert(header::WWW_AUTHENTICATE, value);
     }
     res
-}
-
-fn truncated(s: &str) -> String {
-    s.chars().take(MAX_AUDIT_STR).collect()
 }
 
 /// One audit record. A write leaves an `attempt` line before it runs and a

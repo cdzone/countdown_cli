@@ -4,7 +4,10 @@ mod common;
 
 use std::{ffi::OsStr, path::Path, process::Command, time::Duration};
 
-use common::{token_file, token_table, CliProcess, McpClient, McpProcess, SERVICE_TOKEN};
+use common::{
+    caller_auth, token_file, token_table, CliProcess, McpClient, McpProcess, CALLER_ID,
+    CALLER_TOKEN, SERVICE_TOKEN,
+};
 use serde_json::Value;
 
 const CONFIG: &str = r#"# keep me
@@ -158,7 +161,7 @@ async fn mcp_tool_call_through_the_real_api_succeeds() {
     let (api, base) = start_api(dir.path(), &audit).await;
     let svc_file = token_file(dir.path(), "svc.token", SERVICE_TOKEN, 0o600);
     let mcp = McpProcess::spawn(&base, Some(&svc_file), |_| {});
-    let mcp_client = McpClient::connect(mcp.url(), None).await;
+    let mcp_client = McpClient::connect(mcp.url(), Some(&caller_auth())).await;
 
     let result = mcp_client
         .call_tool("list_countdowns", serde_json::json!({}))
@@ -185,9 +188,72 @@ async fn mcp_tool_call_through_the_real_api_succeeds() {
     assert_eq!(ids(&via_mcp), ids(&direct));
     assert_eq!(ids(&direct).len(), 1);
 
+    // A failing call (API 404) must be audited on both sides as well.
+    let missing = mcp_client
+        .call_tool(
+            "get_countdown",
+            serde_json::json!({"id": "00000000-0000-4000-8000-000000000000"}),
+        )
+        .await;
+    assert_eq!(missing["isError"], true, "{missing}");
+
+    // Acceptance 10: one MCP line per tool call, joined to the API line by
+    // request_id; the API records the MCP caller as on_behalf_of.
+    let mcp_lines = mcp.audit_lines();
+    let api_lines = audit_lines(&audit);
+    let tool_lines: Vec<&Value> = mcp_lines
+        .iter()
+        .filter(|l| l["action"].as_str().unwrap().starts_with("tool:"))
+        .collect();
+    assert_eq!(tool_lines.len(), 2, "{mcp_lines:?}");
+    for (line, result, outcome, api_outcome) in [
+        (tool_lines[0], &result, "ok", "ok"),
+        (tool_lines[1], &missing, "not_found", "not_found"),
+    ] {
+        let id = line["request_id"].as_str().unwrap();
+        assert_eq!(result["_meta"]["request_id"], id, "{result}");
+        assert_eq!(line["svc"], "mcp");
+        assert_eq!(line["caller"], CALLER_ID);
+        assert_eq!(line["outcome"], outcome);
+        for field in [
+            "ts",
+            "on_behalf_of",
+            "target",
+            "params",
+            "is_error",
+            "duration_ms",
+        ] {
+            assert!(line.get(field).is_some(), "{field} missing in {line}");
+        }
+        let api_line = api_lines
+            .iter()
+            .find(|l| l["request_id"] == id)
+            .unwrap_or_else(|| panic!("no API line for {id}: {api_lines:?}"));
+        assert_eq!(api_line["caller"], "mcp-svc");
+        assert_eq!(api_line["on_behalf_of"], CALLER_ID);
+        assert_eq!(api_line["outcome"], api_outcome);
+    }
+
+    // Acceptance 11: no token or digest on either process's stderr or in
+    // either audit file.
+    let everything = format!(
+        "{}{}{}{}",
+        api.stderr(),
+        mcp.stderr(),
+        std::fs::read_to_string(&audit).unwrap(),
+        std::fs::read_to_string(&mcp.audit).unwrap()
+    );
+    for secret in [SERVICE_TOKEN, ADMIN_TOKEN, CALLER_TOKEN] {
+        assert!(!everything.contains(secret), "token leaked");
+        assert!(
+            !everything.contains(&common::sha256_hex(secret)),
+            "digest leaked"
+        );
+    }
+
     let from_mcp: Vec<Value> = audit_lines(&audit)
         .into_iter()
-        .filter(|l| l["caller"] == "mcp-svc")
+        .filter(|l| l["caller"] == "mcp-svc" && l["action"] == "GET /countdowns")
         .collect();
     // startup probe + the tool call
     assert!(from_mcp.len() >= 2, "{from_mcp:?}");
@@ -324,4 +390,38 @@ async fn hanging_terminal_notifier_does_not_block_the_api() {
         api.stderr()
     );
     drop(api);
+}
+
+/// Bodies over 2 MiB are refused with 413 before the write runs.
+#[tokio::test]
+async fn oversized_write_body_is_413_and_not_executed() {
+    let dir = tempfile::tempdir().unwrap();
+    let audit = dir.path().join("audit.jsonl");
+    let (_api, base) = start_api(dir.path(), &audit).await;
+    let config = dir.path().join("c.toml");
+    let before = std::fs::read(&config).unwrap();
+    let before_lines = audit_lines(&audit).len();
+
+    let title = "x".repeat(3 * 1024 * 1024);
+    let res = client()
+        .post(format!("{base}/countdowns"))
+        .bearer_auth(ADMIN_TOKEN)
+        .json(&serde_json::json!({"title": title, "datetime": "2030-01-01 00:00:00"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 413);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "payload_too_large");
+    assert_eq!(std::fs::read(&config).unwrap(), before, "write executed");
+
+    let new: Vec<Value> = audit_lines(&audit).split_off(before_lines);
+    assert!(new.iter().all(|l| l["phase"] != "attempt"), "{new:?}");
+    let result: Vec<&Value> = new.iter().filter(|l| l["status"] == 413).collect();
+    assert_eq!(result.len(), 1, "{new:?}");
+    assert_eq!(result[0]["outcome"], "invalid");
+    assert_eq!(result[0]["caller"], "admin");
+    assert!(!std::fs::read_to_string(&audit)
+        .unwrap()
+        .contains(&"x".repeat(64)));
 }
