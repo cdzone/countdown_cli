@@ -341,11 +341,8 @@ async fn terminal_run(
         for (title, target_datetime, id_opt) in target_datetimes.iter() {
             let remaining = *target_datetime - now;
             let remaining_seconds = remaining.num_seconds();
-            if remaining_seconds != 0 {
-                // 去重基于 id（若无id则退化为title）
-                let key = id_opt.clone().unwrap_or_else(|| title.clone());
-                notified_at_zero.remove(&key);
-            }
+            let notify_now =
+                should_notify(&mut notified_at_zero, id_opt.as_deref(), title, remaining_seconds);
 
             let message = match remaining_seconds {
                 86401_i64..=i64::MAX => {
@@ -377,8 +374,7 @@ async fn terminal_run(
                     )
                 }
                 0 => {
-                    let key = id_opt.clone().unwrap_or_else(|| title.clone());
-                    if notified_at_zero.insert(key) {
+                    if notify_now {
                         let _ =
                             osx_terminal_notifier(title, "时间到了", notify_sound.clone()).await;
                     }
@@ -402,6 +398,21 @@ async fn terminal_run(
 
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// 到点只通知一次：按 id 去重（没有 id 时退化为 title），离开 0 秒后清掉记录。
+fn should_notify(
+    notified: &mut HashSet<String>,
+    id: Option<&str>,
+    title: &str,
+    remaining_seconds: i64,
+) -> bool {
+    let key = id.unwrap_or(title).to_string();
+    if remaining_seconds != 0 {
+        notified.remove(&key);
+        return false;
+    }
+    notified.insert(key)
 }
 
 fn handle_user_input(tx: std_mpsc::Sender<String>, if_running: Arc<AtomicBool>) {
@@ -564,5 +575,20 @@ mod pomodoro_interval_tests {
         t.set_state(PomodoroState::Work);
         t.next_state();
         assert_eq!(t.state, PomodoroState::LongBreak);
+    }
+}
+
+#[cfg(test)]
+mod notify_dedup_tests {
+    use super::*;
+
+    #[test]
+    fn same_title_reminders_due_together_both_notify_once() {
+        let mut notified = HashSet::new();
+        assert!(should_notify(&mut notified, Some("id-1"), "A", 0));
+        assert!(should_notify(&mut notified, Some("id-2"), "A", 0));
+        // 下一帧仍是 0 秒：不重复通知
+        assert!(!should_notify(&mut notified, Some("id-1"), "A", 0));
+        assert!(!should_notify(&mut notified, Some("id-2"), "A", 0));
     }
 }
