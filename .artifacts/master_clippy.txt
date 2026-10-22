@@ -1,2 +1,0 @@
-    Checking countdown_cli v0.3.1 (/workspace)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.12s
