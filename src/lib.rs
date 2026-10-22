@@ -5,6 +5,7 @@ use std::{fmt, io::Read, sync::Arc};
 use tokio::sync::Mutex;
 
 /// 热加载特性
+#[allow(async_fn_in_trait)]
 pub trait HotReload {
     async fn reload(&mut self) -> Result<(), Box<dyn std::error::Error>>;
 }
@@ -46,6 +47,8 @@ impl<'de> de::Deserialize<'de> for RepeatMode {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Countdown {
+    #[serde(default)]
+    pub id: Option<String>,
     pub title: String,
     pub datetime: String,
     #[serde(default = "default_enabled")]
@@ -170,6 +173,332 @@ pub fn calculate_target_time(
             }
         }
     }
+}
+
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+use tokio::sync::{RwLock, RwLockReadGuard};
+
+/// 统一的数据与mtime存储（供终端/热加载/API共享）
+#[derive(Debug)]
+pub struct CountdownStore {
+    file_path: PathBuf,
+    data: RwLock<CountDownData>,
+    last_mtime: RwLock<Option<SystemTime>>,
+    api_mode_enabled: bool,
+}
+
+impl CountdownStore {
+    pub async fn new<P: Into<PathBuf>>(
+        file_path: P,
+        api_mode_enabled: bool,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+        let file_path = file_path.into();
+        let (data, mtime) = Self::load_from_file(&file_path)?;
+        let store = Arc::new(Self {
+            file_path,
+            data: RwLock::new(data),
+            last_mtime: RwLock::new(mtime),
+            api_mode_enabled,
+        });
+        if api_mode_enabled {
+            // 补id并落盘（只加id行，保留注释排版）
+            store.ensure_ids_and_persist_if_needed().await?;
+        }
+        Ok(store)
+    }
+
+    fn load_from_file(path: &Path) -> Result<(CountDownData, Option<SystemTime>), Box<dyn std::error::Error>> {
+        let mut file = std::fs::File::open(path)?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+        let countdown_data: CountDownData = toml::from_str(&contents)?;
+        let last_mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        Ok((countdown_data, last_mtime))
+    }
+
+    pub async fn read_data(&self) -> RwLockReadGuard<'_, CountDownData> {
+        self.data.read().await
+    }
+
+    pub async fn reload_if_changed(&self) -> Result<bool, Box<dyn std::error::Error>> {
+        let modified = std::fs::metadata(&self.file_path)?.modified()?;
+        {
+            let last = self.last_mtime.read().await;
+            if *last == Some(modified) {
+                return Ok(false);
+            }
+        }
+        self.reload().await?;
+        {
+            let mut last = self.last_mtime.write().await;
+            *last = Some(modified);
+        }
+        Ok(true)
+    }
+
+    pub async fn reload(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let (new_data, _) = Self::load_from_file(&self.file_path)?;
+        {
+            let mut data_lock = self.data.write().await;
+            *data_lock = new_data;
+        }
+        if self.api_mode_enabled {
+            self.ensure_ids_and_persist_if_needed().await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_ids_and_persist_if_needed(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut updated = false;
+        {
+            let mut data = self.data.write().await;
+            for c in data.countdown.iter_mut() {
+                if c.id.is_none() {
+                    c.id = Some(uuid::Uuid::new_v4().to_string());
+                    updated = true;
+                }
+            }
+        }
+        if updated {
+            // 用 toml_edit 给缺失id的条目加一行，并写回（写前备份 .bak）
+            self.write_back_with_id_injection().await?;
+        }
+        Ok(())
+    }
+
+    async fn write_back_with_id_injection(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let original = std::fs::read_to_string(&self.file_path)?;
+        let mut doc = original.parse::<toml_edit::DocumentMut>()?;
+        // 备份
+        let bak_path = self.file_path.with_extension("toml.bak");
+        std::fs::write(&bak_path, &original)?;
+        if let Some(arr) = doc.get_mut("countdown").and_then(|it| it.as_array_of_tables_mut()) {
+            let data = self.data.read().await;
+            // 构建索引：按 title+datetime+repeat+enabled 粗略配对（无id文件）
+            // 为稳妥：逐条检查，如果该表没有id，则从data里找同序同值的id并填入
+            let mut idx = 0usize;
+            for table in arr.iter_mut() {
+                if !table.contains_key("id") {
+                    // 从内存数据按顺序定位对应项
+                    while idx < data.countdown.len() {
+                        let c = &data.countdown[idx];
+                        idx += 1;
+                        if let Some(id) = &c.id {
+                            // 基于字段匹配（title+datetime），尽量与原条目对应
+                            let t = table
+                                .get("title")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default();
+                            let dt = table
+                                .get("datetime")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default();
+                            if c.title == t && c.datetime == dt {
+                                table.insert("id", toml_edit::value(id.clone()));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let tmp_path = self
+            .file_path
+            .with_extension("toml.tmp");
+        std::fs::write(&tmp_path, doc.to_string())?;
+        std::fs::rename(&tmp_path, &self.file_path)?;
+        // 更新mtime
+        let modified = std::fs::metadata(&self.file_path)?.modified().ok();
+        let mut last = self.last_mtime.write().await;
+        *last = modified;
+        Ok(())
+    }
+
+    // --- API-side mutation helpers ---
+    pub async fn api_create(
+        &self,
+        title: String,
+        datetime: String,
+        enabled: bool,
+        repeat: Option<RepeatMode>,
+    ) -> Result<Countdown, Box<dyn std::error::Error>> {
+        self.sync_from_disk_if_stale().await?;
+        let id = uuid::Uuid::new_v4().to_string();
+        // 编辑 toml 文档并落盘（保留注释）
+        let original = std::fs::read_to_string(&self.file_path)?;
+        let mut doc = original.parse::<toml_edit::DocumentMut>()?;
+        // 构建新表
+        let mut new_table = toml_edit::Table::new();
+        new_table.insert("id", toml_edit::value(id.clone()));
+        new_table.insert("title", toml_edit::value(title.clone()));
+        new_table.insert("datetime", toml_edit::value(datetime.clone()));
+        new_table.insert("enabled", toml_edit::value(enabled));
+        if let Some(r) = &repeat {
+            let s = match r {
+                RepeatMode::Daily => "daily",
+                RepeatMode::Weekday => "weekday",
+            };
+            new_table.insert("repeat", toml_edit::value(s));
+        }
+        new_table.set_implicit(true);
+        if !doc.contains_key("countdown") {
+            doc["countdown"] = toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
+        }
+        doc["countdown"]
+            .as_array_of_tables_mut()
+            .unwrap()
+            .push(new_table);
+        let tmp = self.file_path.with_extension("toml.tmp");
+        std::fs::write(&tmp, doc.to_string())?;
+        std::fs::rename(&tmp, &self.file_path)?;
+        let created = Countdown {
+            id: Some(id),
+            title,
+            datetime,
+            enabled,
+            repeat,
+        };
+        {
+            let mut data = self.data.write().await;
+            data.countdown.push(created.clone());
+        }
+        let mut last = self.last_mtime.write().await;
+        *last = std::fs::metadata(&self.file_path).and_then(|m| m.modified()).ok();
+        Ok(created)
+    }
+
+    pub async fn api_update(
+        &self,
+        id: &str,
+        title: String,
+        datetime: String,
+        enabled: bool,
+        repeat: Option<RepeatMode>,
+    ) -> Result<Countdown, CountdownUpdateError> {
+        self.sync_from_disk_if_stale()
+            .await
+            .map_err(|e| CountdownUpdateError::Other(e.to_string()))?;
+        let original = std::fs::read_to_string(&self.file_path)
+            .map_err(|e| CountdownUpdateError::Other(e.to_string()))?;
+        let mut doc = original
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| CountdownUpdateError::Other(e.to_string()))?;
+        // 找到带id的表并替换字段
+        let mut found = false;
+        if let Some(arr) = doc.get_mut("countdown").and_then(|it| it.as_array_of_tables_mut()) {
+            for table in arr.iter_mut() {
+                if table
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s == id)
+                    .unwrap_or(false)
+                {
+                    found = true;
+                    table.insert("title", toml_edit::value(title.clone()));
+                    table.insert("datetime", toml_edit::value(datetime.clone()));
+                    table.insert("enabled", toml_edit::value(enabled));
+                    match &repeat {
+                        None => {
+                            table.remove("repeat");
+                        }
+                        Some(r) => {
+                            let s = match r {
+                                RepeatMode::Daily => "daily",
+                                RepeatMode::Weekday => "weekday",
+                            };
+                            table.insert("repeat", toml_edit::value(s));
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        if !found {
+            return Err(CountdownUpdateError::NotFound);
+        }
+        let tmp = self.file_path.with_extension("toml.tmp");
+        std::fs::write(&tmp, doc.to_string())
+            .map_err(|e| CountdownUpdateError::Other(e.to_string()))?;
+        std::fs::rename(&tmp, &self.file_path)
+            .map_err(|e| CountdownUpdateError::Other(e.to_string()))?;
+        {
+            let mut data = self.data.write().await;
+            if let Some(existing) = data.countdown.iter_mut().find(|c| c.id.as_deref() == Some(id))
+            {
+                existing.title = title.clone();
+                existing.datetime = datetime.clone();
+                existing.enabled = enabled;
+                existing.repeat = repeat.clone();
+            }
+        }
+        let mut last = self.last_mtime.write().await;
+        *last = std::fs::metadata(&self.file_path).and_then(|m| m.modified()).ok();
+        let updated = {
+            let data = self.data.read().await;
+            data.countdown
+                .iter()
+                .find(|c| c.id.as_deref() == Some(id))
+                .cloned()
+                .unwrap()
+        };
+        Ok(updated)
+    }
+
+    pub async fn api_delete(&self, id: &str) -> Result<bool, Box<dyn std::error::Error>> {
+        self.sync_from_disk_if_stale().await?;
+        let original = std::fs::read_to_string(&self.file_path)?;
+        let mut doc = original.parse::<toml_edit::DocumentMut>()?;
+        let mut deleted = false;
+        if let Some(arr) = doc.get_mut("countdown").and_then(|it| it.as_array_of_tables_mut()) {
+            let len_before = arr.len();
+            arr.retain(|table| {
+                let is_target = table
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s == id)
+                    .unwrap_or(false);
+                if is_target {
+                    deleted = true;
+                    false
+                } else {
+                    true
+                }
+            });
+            let _ = len_before;
+        }
+        if !deleted {
+            return Ok(false);
+        }
+        let tmp = self.file_path.with_extension("toml.tmp");
+        std::fs::write(&tmp, doc.to_string())?;
+        std::fs::rename(&tmp, &self.file_path)?;
+        {
+            let mut data = self.data.write().await;
+            data.countdown.retain(|c| c.id.as_deref() != Some(id));
+        }
+        let mut last = self.last_mtime.write().await;
+        *last = std::fs::metadata(&self.file_path).and_then(|m| m.modified()).ok();
+        Ok(true)
+    }
+
+    async fn sync_from_disk_if_stale(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let disk_mtime = std::fs::metadata(&self.file_path)?.modified()?;
+        let last = self.last_mtime.read().await;
+        if *last != Some(disk_mtime) {
+            drop(last);
+            self.reload().await?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub enum CountdownUpdateError {
+    NotFound,
+    Other(String),
 }
 
 #[cfg(test)]
