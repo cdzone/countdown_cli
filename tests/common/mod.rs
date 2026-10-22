@@ -74,6 +74,37 @@ pub fn output_with_deadline(cmd: &mut Command) -> std::process::Output {
     }
 }
 
+/// Describes whether `child` is still running and, on Linux, what each of its
+/// threads is blocked in, so a timed-out test shows where the server stopped.
+fn child_state(child: &mut Child) -> String {
+    match child.try_wait() {
+        Ok(Some(status)) => format!("exited: {status}"),
+        Ok(None) => {
+            let pid = child.id();
+            let mut out = format!("still running (pid {pid})");
+            if let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) {
+                for task in tasks.flatten() {
+                    let dir = task.path();
+                    let read = |f: &str| {
+                        std::fs::read_to_string(dir.join(f))
+                            .unwrap_or_default()
+                            .trim()
+                            .to_owned()
+                    };
+                    out.push_str(&format!(
+                        "\n  thread {} {}: wchan={}",
+                        task.file_name().to_string_lossy(),
+                        read("comm"),
+                        read("wchan")
+                    ));
+                }
+            }
+            out
+        }
+        Err(e) => format!("state unknown: {e}"),
+    }
+}
+
 pub fn free_port() -> u16 {
     StdListener::bind("127.0.0.1:0")
         .unwrap()
@@ -191,7 +222,11 @@ impl McpProcess {
 impl Drop for McpProcess {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            eprintln!("countdown_mcp stderr:\n{}", self.stderr());
+            eprintln!(
+                "countdown_mcp {}\nstderr:\n{}",
+                child_state(&mut self.child),
+                self.stderr()
+            );
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -350,7 +385,11 @@ impl Drop for CliProcess {
         // A timed-out request panics; show what the API said so a red CI run
         // explains itself.
         if std::thread::panicking() {
-            eprintln!("countdown_cli stderr:\n{}", self.stderr());
+            eprintln!(
+                "countdown_cli {}\nstderr:\n{}",
+                child_state(&mut self.child),
+                self.stderr()
+            );
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
