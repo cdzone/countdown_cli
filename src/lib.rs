@@ -179,9 +179,9 @@ pub fn calculate_target_time(
 }
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 use tokio::sync::{RwLock, RwLockReadGuard};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// 统一的数据与mtime存储（供终端/热加载/API共享）
 #[derive(Debug)]
@@ -215,7 +215,9 @@ impl CountdownStore {
         Ok(store)
     }
 
-    fn load_from_file(path: &Path) -> Result<(CountDownData, Option<SystemTime>), Box<dyn std::error::Error>> {
+    fn load_from_file(
+        path: &Path,
+    ) -> Result<(CountDownData, Option<SystemTime>), Box<dyn std::error::Error>> {
         let mut file = std::fs::File::open(path)?;
         let mut contents = String::new();
         file.read_to_string(&mut contents)?;
@@ -264,11 +266,16 @@ impl CountdownStore {
 
     /// 给文件里缺 id 的条目补 id：直接在 toml_edit 文档上补，
     /// 再从补好的文档解析内存数据，内存和文件不需要再做配对。
-    async fn ensure_ids_and_persist_if_needed_locked(&self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn ensure_ids_and_persist_if_needed_locked(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let original = std::fs::read_to_string(&self.file_path)?;
         let mut doc = original.parse::<toml_edit::DocumentMut>()?;
         let mut updated = false;
-        if let Some(arr) = doc.get_mut("countdown").and_then(|it| it.as_array_of_tables_mut()) {
+        if let Some(arr) = doc
+            .get_mut("countdown")
+            .and_then(|it| it.as_array_of_tables_mut())
+        {
             for table in arr.iter_mut() {
                 if !table.contains_key("id") {
                     table.insert("id", toml_edit::value(uuid::Uuid::new_v4().to_string()));
@@ -348,7 +355,9 @@ impl CountdownStore {
             data.countdown.push(created.clone());
         }
         let mut last = self.last_mtime.write().await;
-        *last = std::fs::metadata(&self.file_path).and_then(|m| m.modified()).ok();
+        *last = std::fs::metadata(&self.file_path)
+            .and_then(|m| m.modified())
+            .ok();
         Ok(created)
     }
 
@@ -371,7 +380,10 @@ impl CountdownStore {
             .map_err(|e| CountdownUpdateError::Other(e.to_string()))?;
         // 找到带id的表并替换字段
         let mut found = false;
-        if let Some(arr) = doc.get_mut("countdown").and_then(|it| it.as_array_of_tables_mut()) {
+        if let Some(arr) = doc
+            .get_mut("countdown")
+            .and_then(|it| it.as_array_of_tables_mut())
+        {
             for table in arr.iter_mut() {
                 if table
                     .get("id")
@@ -409,7 +421,10 @@ impl CountdownStore {
             .map_err(|e| CountdownUpdateError::Other(e.to_string()))?;
         {
             let mut data = self.data.write().await;
-            if let Some(existing) = data.countdown.iter_mut().find(|c| c.id.as_deref() == Some(id))
+            if let Some(existing) = data
+                .countdown
+                .iter_mut()
+                .find(|c| c.id.as_deref() == Some(id))
             {
                 existing.title = title.clone();
                 existing.datetime = datetime.clone();
@@ -418,7 +433,9 @@ impl CountdownStore {
             }
         }
         let mut last = self.last_mtime.write().await;
-        *last = std::fs::metadata(&self.file_path).and_then(|m| m.modified()).ok();
+        *last = std::fs::metadata(&self.file_path)
+            .and_then(|m| m.modified())
+            .ok();
         let updated = {
             let data = self.data.read().await;
             data.countdown
@@ -436,7 +453,10 @@ impl CountdownStore {
         let original = std::fs::read_to_string(&self.file_path)?;
         let mut doc = original.parse::<toml_edit::DocumentMut>()?;
         let mut deleted = false;
-        if let Some(arr) = doc.get_mut("countdown").and_then(|it| it.as_array_of_tables_mut()) {
+        if let Some(arr) = doc
+            .get_mut("countdown")
+            .and_then(|it| it.as_array_of_tables_mut())
+        {
             let len_before = arr.len();
             arr.retain(|table| {
                 let is_target = table
@@ -464,7 +484,9 @@ impl CountdownStore {
             data.countdown.retain(|c| c.id.as_deref() != Some(id));
         }
         let mut last = self.last_mtime.write().await;
-        *last = std::fs::metadata(&self.file_path).and_then(|m| m.modified()).ok();
+        *last = std::fs::metadata(&self.file_path)
+            .and_then(|m| m.modified())
+            .ok();
         Ok(true)
     }
 
