@@ -87,21 +87,34 @@ fn unwritable_audit_log_refuses_startup() {
 
 /// Starts the real API and waits until it answers.
 async fn start_api(dir: &Path, audit: &Path) -> (CliProcess, String) {
+    start_api_with(dir, audit, |_| {}).await
+}
+
+/// `start_api` with `extra` applied to the command before it starts.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+async fn start_api_with(
+    dir: &Path,
+    audit: &Path,
+    extra: impl FnOnce(&mut Command),
+) -> (CliProcess, String) {
     let config = dir.join("c.toml");
     std::fs::write(&config, CONFIG).unwrap();
     let table = dir.join("tokens.toml");
     std::fs::write(&table, tables()).unwrap();
     let addr = format!("127.0.0.1:{}", common::free_port());
-    let proc = CliProcess::spawn(&[
-        "-c".as_ref(),
-        config.as_os_str(),
-        "--api".as_ref(),
-        addr.as_ref(),
-        "--api-tokens".as_ref(),
-        table.as_os_str(),
-        "--audit-log".as_ref(),
-        audit.as_os_str(),
-    ]);
+    let proc = CliProcess::spawn_with(
+        &[
+            "-c".as_ref(),
+            config.as_os_str(),
+            "--api".as_ref(),
+            addr.as_ref(),
+            "--api-tokens".as_ref(),
+            table.as_os_str(),
+            "--audit-log".as_ref(),
+            audit.as_os_str(),
+        ],
+        extra,
+    );
     let base = format!("http://{addr}");
     let http = client();
     // The port is bound before the server runs, so a probe can connect and
@@ -230,4 +243,85 @@ async fn audit_failure_blocks_writes_but_not_reads_and_stays_off_stderr() {
     assert_eq!(res.headers()["x-audit-status"], "unavailable");
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(api.stderr(), stderr_before, "API wrote to stderr");
+}
+
+/// Kills every fake `terminal-notifier` that recorded its pid, so a red run
+/// does not leave `sleep 600` behind.
+#[cfg(all(unix, not(target_os = "macos")))]
+struct FakeNotifierPids(std::path::PathBuf);
+
+#[cfg(all(unix, not(target_os = "macos")))]
+impl FakeNotifierPids {
+    fn pids(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.0)
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+impl Drop for FakeNotifierPids {
+    fn drop(&mut self) {
+        for pid in self.pids() {
+            let _ = Command::new("kill")
+                .args(["-9", &pid])
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+}
+
+/// A `terminal-notifier` that never exits must not keep the API from serving;
+/// off macOS it is never spawned at all.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[tokio::test]
+async fn hanging_terminal_notifier_does_not_block_the_api() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let pid_file = dir.path().join("notifier.pids");
+    let guard = FakeNotifierPids(pid_file.clone());
+    let script = bin.join("terminal-notifier");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho $$ >> '{}'\nexec sleep 600\n",
+            pid_file.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+
+    let audit = dir.path().join("audit.jsonl");
+    let (api, base) = start_api_with(dir.path(), &audit, |cmd| {
+        cmd.env("PATH", &path);
+    })
+    .await;
+    let res = client()
+        .get(format!("{base}/countdowns"))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    // Off macOS the notifier is never spawned and nothing is printed about it.
+    assert!(
+        guard.pids().is_empty(),
+        "terminal-notifier spawned on non-macOS"
+    );
+    assert!(
+        !api.stderr().contains("terminal-notifier"),
+        "stderr: {}",
+        api.stderr()
+    );
+    drop(api);
 }

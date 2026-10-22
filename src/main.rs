@@ -508,9 +508,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await
     });
-    if let Err(msg) = probe_terminal_notifier() {
-        eprintln!("警告: {msg}");
-    }
+    // 探测放到独立线程：通知程序卡住也不能挡住下面的 API 启动
+    std::thread::spawn(|| {
+        if let Err(msg) = probe_terminal_notifier() {
+            eprintln!("警告: {msg}");
+        }
+    });
 
     let store_for_reload = store.clone();
     let _reload_handle = tokio::spawn(async move {

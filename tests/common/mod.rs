@@ -348,14 +348,19 @@ pub struct CliProcess {
 
 impl CliProcess {
     pub fn spawn(args: &[&std::ffi::OsStr]) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_countdown_cli"))
-            .args(args)
+        Self::spawn_with(args, |_| {})
+    }
+
+    /// Like `spawn`; `extra` adjusts the command (e.g. its env) before start.
+    pub fn spawn_with(args: &[&std::ffi::OsStr], extra: impl FnOnce(&mut Command)) -> Self {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_countdown_cli"));
+        cmd.args(args)
             .env_remove("COUNTDOWN_API_TOKENS")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::piped());
+        extra(&mut cmd);
+        let mut child = cmd.spawn().unwrap();
         let stdin = child.stdin.take().unwrap();
         let mut pipe = child.stderr.take().unwrap();
         let stderr = Arc::new(Mutex::new(String::new()));
