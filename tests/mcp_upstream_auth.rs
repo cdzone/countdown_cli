@@ -13,10 +13,10 @@ use axum::{
     response::IntoResponse,
     Router,
 };
-use common::{token_file, McpClient, McpProcess, SERVICE_TOKEN};
+use common::{caller_auth, token_file, McpClient, McpProcess, SERVICE_TOKEN};
 use serde_json::{json, Value};
 
-const CLIENT_TOKEN: &str = "client-token-should-never-reach-the-api";
+const CLIENT_TOKEN: &str = common::CALLER_TOKEN;
 const BODY_MARKER: &str = "BODY-MARKER-7f3a";
 
 type Seen = Arc<Mutex<Vec<HeaderMap>>>;
@@ -97,7 +97,7 @@ async fn upstream_401_is_fixed_tool_error_and_one_json_line() {
     let token = token_file(dir.path(), "api.token", SERVICE_TOKEN, 0o600);
     let mcp = McpProcess::spawn(&api, Some(&token), |_| {});
 
-    let client = McpClient::connect(mcp.url(), None).await;
+    let client = McpClient::connect(mcp.url(), Some(&caller_auth())).await;
     let result = client.call_tool("list_countdowns", json!({})).await;
     assert_eq!(result["isError"], json!(true), "{result}");
     assert_eq!(
@@ -110,11 +110,17 @@ async fn upstream_401_is_fixed_tool_error_and_one_json_line() {
         .to_str()
         .unwrap()
         .to_owned();
+    let lines = mcp.audit_lines();
     let stderr = mcp.finish();
     assert_no_secrets(&stderr);
-    let lines = json_lines(&stderr);
-    assert_eq!(lines.len(), 1, "{stderr}");
+    assert!(
+        json_lines(&stderr).is_empty(),
+        "error lines go to the audit file: {stderr}"
+    );
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_no_secrets(&serde_json::to_string(&lines).unwrap());
     let line = &lines[0];
+    assert_eq!(line["is_error"], true);
     assert_eq!(line["svc"], "mcp");
     assert_eq!(line["request_id"], tool_request_id.as_str());
     assert_eq!(line["action"], "tool:list_countdowns");
@@ -151,9 +157,10 @@ async fn unreachable_api_at_startup_is_reported_and_serving_continues() {
     let mcp = McpProcess::spawn(&format!("http://127.0.0.1:{port}"), Some(&token), |_| {});
 
     assert!(mcp.wait_for_stderr("listening"), "{}", mcp.stderr());
+    let lines = mcp.audit_lines();
     let stderr = mcp.finish();
-    let lines = json_lines(&stderr);
-    assert_eq!(lines.len(), 1, "{stderr}");
+    assert!(json_lines(&stderr).is_empty(), "{stderr}");
+    assert_eq!(lines.len(), 1, "{lines:?}");
     assert_eq!(lines[0]["svc"], "mcp");
     assert_eq!(lines[0]["outcome"], "upstream_unreachable");
     assert!(uuid::Uuid::parse_str(lines[0]["request_id"].as_str().unwrap()).is_ok());

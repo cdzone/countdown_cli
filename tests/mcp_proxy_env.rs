@@ -3,7 +3,7 @@
 mod common;
 
 use axum::{routing::get, Json, Router};
-use common::{token_file, McpClient, McpProcess, SERVICE_TOKEN};
+use common::{caller_auth, token_file, McpClient, McpProcess, SERVICE_TOKEN};
 use serde_json::json;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -33,7 +33,7 @@ async fn list_works_with_proxy_env_set() {
             .env_remove("no_proxy");
     });
 
-    let client = McpClient::connect(mcp.url(), None).await;
+    let client = McpClient::connect(mcp.url(), Some(&caller_auth())).await;
     let result = client.call_tool("list_countdowns", json!({})).await;
     assert_eq!(result["isError"], json!(false), "{result}");
     let text = result["content"][0]["text"].as_str().unwrap();
