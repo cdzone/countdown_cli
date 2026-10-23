@@ -112,18 +112,23 @@ async fn stack() -> Stack {
     )
     .unwrap();
     let audit = dir.path().join("api-audit.jsonl");
-    let addr = format!("127.0.0.1:{}", common::free_port());
     let api = CliProcess::spawn(&[
         "-c".as_ref(),
         config.as_os_str(),
         "--api".as_ref(),
-        addr.as_ref(),
+        "127.0.0.1:0".as_ref(),
         "--api-tokens".as_ref(),
         table.as_os_str(),
         "--audit-log".as_ref(),
         audit.as_os_str(),
     ]);
-    let base = format!("http://{addr}");
+    assert!(
+        api.wait_for_stderr("countdown API listening on"),
+        "{}",
+        api.stderr()
+    );
+    let port = common::parse_listening_port(&api.stderr());
+    let base = format!("http://127.0.0.1:{port}");
     let http = common::http_client();
     let deadline = Instant::now() + common::PROCESS_TIMEOUT;
     loop {
@@ -135,7 +140,11 @@ async fn stack() -> Stack {
         if probe.is_ok() {
             break;
         }
-        assert!(Instant::now() < deadline, "API did not answer");
+        assert!(
+            Instant::now() < deadline,
+            "API did not answer; stderr: {}",
+            api.stderr()
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let svc = token_file(dir.path(), "svc.token", common::SERVICE_TOKEN, 0o600);

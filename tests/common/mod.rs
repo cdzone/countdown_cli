@@ -129,6 +129,22 @@ pub fn free_port() -> u16 {
         .port()
 }
 
+/// Parses `listening on http://127.0.0.1:PORT` (API or MCP) from stderr.
+pub fn parse_listening_port(stderr: &str) -> u16 {
+    for line in stderr.lines() {
+        let Some(rest) = line.split("listening on http://").nth(1) else {
+            continue;
+        };
+        let hostport = rest.split('/').next().unwrap_or(rest).trim();
+        if let Some(port) = hostport.rsplit(':').next() {
+            if let Ok(p) = port.parse() {
+                return p;
+            }
+        }
+    }
+    panic!("no listening address in stderr: {stderr}");
+}
+
 /// Writes `content` to `dir/name` with the given Unix mode.
 pub fn token_file(dir: &Path, name: &str, content: &str, mode: u32) -> PathBuf {
     let path = dir.join(name);
@@ -161,7 +177,6 @@ impl McpProcess {
         token_file: Option<&Path>,
         extra: impl FnOnce(&mut Command),
     ) -> Self {
-        let port = free_port();
         let dir = tempfile::tempdir().unwrap();
         let tokens = dir.path().join("mcp-tokens.toml");
         std::fs::write(
@@ -171,8 +186,10 @@ impl McpProcess {
         .unwrap();
         let audit = dir.path().join("mcp-audit.jsonl");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_countdown_mcp"));
+        // Bind :0 in-process and read the real port from the listening line —
+        // avoids the free_port() TOCTOU race with parallel tests.
         cmd.args(["--api-url", api_url])
-            .args(["--addr", &format!("127.0.0.1:{port}")])
+            .args(["--addr", "127.0.0.1:0"])
             .env_remove("COUNTDOWN_API_TOKEN_FILE")
             .env("COUNTDOWN_MCP_TOKENS", &tokens)
             .env("COUNTDOWN_MCP_AUDIT_LOG", &audit)
@@ -194,14 +211,28 @@ impl McpProcess {
                     .push_str(&String::from_utf8_lossy(&buf[..n]));
             }
         });
-        Self {
+        let mut proc = Self {
             child,
             stderr,
             reader: Some(reader),
-            port,
+            port: 0,
             dir,
             audit,
+        };
+        // Resolve the real port from the listening line. If the process exits
+        // first (bad token, etc.), leave port=0; callers use wait_exit/stderr.
+        let deadline = Instant::now() + PROCESS_TIMEOUT;
+        while Instant::now() < deadline {
+            if proc.stderr().contains("listening on") {
+                proc.port = parse_listening_port(&proc.stderr());
+                break;
+            }
+            if proc.child.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
+        proc
     }
 
     pub fn url(&self) -> String {
@@ -417,6 +448,18 @@ impl CliProcess {
 
     pub fn stderr(&self) -> String {
         self.stderr.lock().unwrap().clone()
+    }
+
+    /// Waits until stderr contains `needle`.
+    pub fn wait_for_stderr(&self, needle: &str) -> bool {
+        let deadline = Instant::now() + PROCESS_TIMEOUT;
+        while Instant::now() < deadline {
+            if self.stderr().contains(needle) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
     }
 }
 

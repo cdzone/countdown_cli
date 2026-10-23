@@ -526,8 +526,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 启动HTTP API（仅接受回环地址）
     if let (Some(listener), Some(gate)) = (api_listener, api_gate) {
+        let bound = listener.local_addr()?;
+        eprintln!("countdown API listening on http://{bound}");
         let router = api::build_router(store.clone(), gate);
-        // 不写stdout；axum默认不输出日志
         tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, router).await {
                 eprintln!("API server error: {e}");
