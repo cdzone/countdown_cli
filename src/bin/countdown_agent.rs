@@ -1,10 +1,10 @@
 //! Command-line agent: answers countdown questions with a local
 //! OpenAI-compatible model gateway (Ollama) and the read-only MCP tools.
 //!
-//! Data comes only from the MCP tools `list_countdowns` and `get_countdown`;
-//! this program never calls the countdown API. Whenever a tool fails, or the
-//! model answers without calling a tool, the user gets a fixed 「查不到」 reply
-//! instead of whatever the model would have said.
+//! Data comes only from the MCP tools `list_countdowns`, `get_countdown`, and
+//! `get_next_countdown`; this program never calls the countdown API. Whenever a
+//! tool fails, or the model answers without calling a tool, the user gets a
+//! fixed 「查不到」 reply instead of whatever the model would have said.
 
 use std::{
     io::{BufRead, IsTerminal, Write},
@@ -45,15 +45,17 @@ const DEFAULT_MCP_URL: &str = "http://127.0.0.1:8765/mcp";
 const PLACEHOLDER_API_KEY: &str = "ollama";
 const DEFAULT_MAX_TOOL_CALLS: usize = 5;
 /// The read-only tools the model may call; nothing else is offered to it.
-const TOOLS: [&str; 2] = ["list_countdowns", "get_countdown"];
+const TOOLS: [&str; 3] = ["list_countdowns", "get_countdown", "get_next_countdown"];
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Reasoning models on a laptop can take minutes to answer.
 const MODEL_TIMEOUT: Duration = Duration::from_secs(300);
 
-const SYSTEM_PROMPT: &str = "你是倒计时助手。凡是涉及倒计时的问题，必须先调用工具 \
-list_countdowns 或 get_countdown 查询，只根据工具返回的数据用中文简短回答；\
-不要编造工具没有返回的内容。";
+const SYSTEM_PROMPT: &str = "你是倒计时助手。凡是涉及倒计时的问题，必须先调用工具查询，\
+只根据工具返回的数据用中文简短回答；不要编造工具没有返回的内容。\
+用户问最近的／下一个／马上到期的倒计时，必须调用 get_next_countdown，\
+不要用 list_countdowns 自己挑。问有哪些／哪些过期了用 list_countdowns；\
+已知 id 用 get_countdown。";
 
 const USAGE: &str = "usage: countdown_agent [question...]
        countdown_agent --serve [127.0.0.1:PORT]
@@ -637,7 +639,7 @@ mod tests {
     fn missing_tools_lists_what_is_absent() {
         assert_eq!(
             missing_tools(["get_countdown", "other"].into_iter()),
-            vec!["list_countdowns"]
+            vec!["list_countdowns", "get_next_countdown"]
         );
         assert!(missing_tools(TOOLS.into_iter()).is_empty());
     }
