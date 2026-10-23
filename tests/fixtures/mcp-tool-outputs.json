@@ -1,0 +1,36 @@
+{
+  "get_countdown": {
+    "enabled": true,
+    "expired": false,
+    "id": "morning",
+    "next_remaining_seconds": 3600,
+    "next_target_time": "2026-10-24 09:00:00",
+    "repeat": "daily",
+    "title": "晨会"
+  },
+  "get_next_countdown": {
+    "countdown": {
+      "enabled": true,
+      "expired": false,
+      "id": "morning",
+      "next_remaining_seconds": 3600,
+      "next_target_time": "2026-10-24 09:00:00",
+      "repeat": "daily",
+      "title": "晨会"
+    }
+  },
+  "get_next_countdown_empty": {
+    "countdown": null
+  },
+  "list_countdowns": [
+    {
+      "enabled": true,
+      "expired": false,
+      "id": "morning",
+      "next_remaining_seconds": 3600,
+      "next_target_time": "2026-10-24 09:00:00",
+      "repeat": "daily",
+      "title": "晨会"
+    }
+  ]
+}

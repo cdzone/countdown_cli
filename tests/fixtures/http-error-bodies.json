@@ -1,0 +1,56 @@
+{
+  "audit_unavailable": {
+    "error": {
+      "code": "audit_unavailable",
+      "message": "audit log unavailable"
+    }
+  },
+  "forbidden": {
+    "error": {
+      "code": "forbidden",
+      "message": "insufficient scope"
+    }
+  },
+  "internal": {
+    "error": {
+      "code": "internal",
+      "message": "internal"
+    }
+  },
+  "invalid_body": {
+    "error": {
+      "code": "invalid_body",
+      "message": "title must not be empty"
+    }
+  },
+  "invalid_datetime": {
+    "error": {
+      "code": "invalid_datetime",
+      "message": "invalid datetime format"
+    }
+  },
+  "invalid_repeat": {
+    "error": {
+      "code": "invalid_repeat",
+      "message": "invalid repeat"
+    }
+  },
+  "not_found": {
+    "error": {
+      "code": "not_found",
+      "message": "Countdown not found"
+    }
+  },
+  "payload_too_large": {
+    "error": {
+      "code": "payload_too_large",
+      "message": "request body too large"
+    }
+  },
+  "unauthorized": {
+    "error": {
+      "code": "unauthorized",
+      "message": "missing bearer token"
+    }
+  }
+}
