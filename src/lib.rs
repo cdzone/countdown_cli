@@ -181,6 +181,58 @@ pub fn calculate_target_time(
     }
 }
 
+/// Calculate the **next** occurrence datetime for a countdown (Agent / "which is next").
+///
+/// Unlike [`calculate_target_time`] (elapsed display for the current period), this
+/// always returns a future-or-now target for recurring modes:
+/// - `None` (one-shot): same fixed datetime as [`calculate_target_time`].
+/// - `Daily`: today's clock time if `now` is strictly before it; otherwise tomorrow.
+/// - `Weekday`: the next Mon–Fri clock time that has not yet arrived (`now < target`).
+///   After Friday's target → next Monday; on Sat/Sun → Monday.
+///
+/// Returns `None` if the datetime string cannot be parsed.
+pub fn next_occurrence(
+    datetime_str: &str,
+    repeat: Option<&RepeatMode>,
+    now: NaiveDateTime,
+) -> Option<NaiveDateTime> {
+    let original_datetime =
+        NaiveDateTime::parse_from_str(datetime_str, "%Y-%m-%d %H:%M:%S").ok()?;
+    let clock = original_datetime.time();
+
+    match repeat {
+        None => Some(original_datetime),
+        Some(RepeatMode::Daily) => {
+            let today = now.date().and_time(clock);
+            if now < today {
+                Some(today)
+            } else {
+                Some(today + chrono::Duration::days(1))
+            }
+        }
+        Some(RepeatMode::Weekday) => {
+            let today = now.date().and_time(clock);
+            match now.weekday() {
+                Weekday::Sat => {
+                    Some((now.date() + chrono::Duration::days(2)).and_time(clock))
+                }
+                Weekday::Sun => {
+                    Some((now.date() + chrono::Duration::days(1)).and_time(clock))
+                }
+                _ => {
+                    // Mon–Fri
+                    if now < today {
+                        Some(today)
+                    } else {
+                        let days = if now.weekday() == Weekday::Fri { 3 } else { 1 };
+                        Some((now.date() + chrono::Duration::days(days)).and_time(clock))
+                    }
+                }
+            }
+        }
+    }
+}
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
@@ -791,6 +843,115 @@ datetime = "2030-01-01 00:00:00"
             Some(
                 NaiveDateTime::parse_from_str("2025-01-15 00:00:00", "%Y-%m-%d %H:%M:%S").unwrap()
             )
+        );
+    }
+
+    fn parse_dt(s: &str) -> NaiveDateTime {
+        NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").unwrap()
+    }
+
+    #[test]
+    fn test_next_occurrence_oneshot_same_as_calculate() {
+        let datetime_str = "2024-08-30 18:00:00";
+        let now = parse_dt("2025-01-15 10:00:00");
+        assert_eq!(
+            next_occurrence(datetime_str, None, now),
+            calculate_target_time(datetime_str, None, now)
+        );
+    }
+
+    #[test]
+    fn test_next_occurrence_daily_before_keeps_today() {
+        let datetime_str = "2024-08-30 18:00:00";
+        let now = parse_dt("2025-01-15 10:00:00");
+        assert_eq!(
+            next_occurrence(datetime_str, Some(&RepeatMode::Daily), now),
+            Some(parse_dt("2025-01-15 18:00:00"))
+        );
+    }
+
+    #[test]
+    fn test_next_occurrence_daily_after_rolls_tomorrow() {
+        let datetime_str = "2024-08-30 18:00:00";
+        let now = parse_dt("2025-01-15 19:00:00");
+        // calculate_target_time stays on today (elapsed); next_occurrence rolls.
+        assert_eq!(
+            calculate_target_time(datetime_str, Some(&RepeatMode::Daily), now),
+            Some(parse_dt("2025-01-15 18:00:00"))
+        );
+        assert_eq!(
+            next_occurrence(datetime_str, Some(&RepeatMode::Daily), now),
+            Some(parse_dt("2025-01-16 18:00:00"))
+        );
+    }
+
+    #[test]
+    fn test_next_occurrence_daily_at_exact_target_rolls_tomorrow() {
+        let datetime_str = "2024-08-30 18:00:00";
+        let now = parse_dt("2025-01-15 18:00:00");
+        assert_eq!(
+            next_occurrence(datetime_str, Some(&RepeatMode::Daily), now),
+            Some(parse_dt("2025-01-16 18:00:00"))
+        );
+    }
+
+    #[test]
+    fn test_next_occurrence_weekday_before_keeps_today() {
+        let datetime_str = "2024-08-30 18:00:00";
+        // 2025-01-15 is Wednesday
+        let now = parse_dt("2025-01-15 10:00:00");
+        assert_eq!(
+            next_occurrence(datetime_str, Some(&RepeatMode::Weekday), now),
+            Some(parse_dt("2025-01-15 18:00:00"))
+        );
+    }
+
+    #[test]
+    fn test_next_occurrence_weekday_after_rolls_next_weekday() {
+        let datetime_str = "2024-08-30 18:00:00";
+        // Monday after target → Tuesday
+        let now = parse_dt("2025-01-13 19:00:00");
+        assert_eq!(
+            calculate_target_time(datetime_str, Some(&RepeatMode::Weekday), now),
+            Some(parse_dt("2025-01-13 18:00:00"))
+        );
+        assert_eq!(
+            next_occurrence(datetime_str, Some(&RepeatMode::Weekday), now),
+            Some(parse_dt("2025-01-14 18:00:00"))
+        );
+    }
+
+    #[test]
+    fn test_next_occurrence_weekday_friday_after_rolls_monday() {
+        let datetime_str = "2024-08-30 18:00:00";
+        let now = parse_dt("2025-01-17 19:00:00"); // Friday
+        assert_eq!(
+            next_occurrence(datetime_str, Some(&RepeatMode::Weekday), now),
+            Some(parse_dt("2025-01-20 18:00:00"))
+        );
+    }
+
+    #[test]
+    fn test_next_occurrence_weekday_saturday_to_monday() {
+        let datetime_str = "2024-08-30 18:00:00";
+        let now = parse_dt("2025-01-18 10:00:00"); // Saturday
+        assert_eq!(
+            calculate_target_time(datetime_str, Some(&RepeatMode::Weekday), now),
+            Some(parse_dt("2025-01-17 18:00:00"))
+        );
+        assert_eq!(
+            next_occurrence(datetime_str, Some(&RepeatMode::Weekday), now),
+            Some(parse_dt("2025-01-20 18:00:00"))
+        );
+    }
+
+    #[test]
+    fn test_next_occurrence_weekday_sunday_to_monday() {
+        let datetime_str = "2024-08-30 18:00:00";
+        let now = parse_dt("2025-01-19 10:00:00"); // Sunday
+        assert_eq!(
+            next_occurrence(datetime_str, Some(&RepeatMode::Weekday), now),
+            Some(parse_dt("2025-01-20 18:00:00"))
         );
     }
 }
