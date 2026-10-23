@@ -104,13 +104,12 @@ async fn start_api_with(
     std::fs::write(&config, CONFIG).unwrap();
     let table = dir.join("tokens.toml");
     std::fs::write(&table, tables()).unwrap();
-    let addr = format!("127.0.0.1:{}", common::free_port());
     let proc = CliProcess::spawn_with(
         &[
             "-c".as_ref(),
             config.as_os_str(),
             "--api".as_ref(),
-            addr.as_ref(),
+            "127.0.0.1:0".as_ref(),
             "--api-tokens".as_ref(),
             table.as_os_str(),
             "--audit-log".as_ref(),
@@ -118,10 +117,16 @@ async fn start_api_with(
         ],
         extra,
     );
-    let base = format!("http://{addr}");
+    if !proc.wait_for_stderr("countdown API listening on") {
+        panic!(
+            "API did not print listening address within {:?}; stderr: {}",
+            common::PROCESS_TIMEOUT,
+            proc.stderr()
+        );
+    }
+    let port = common::parse_listening_port(&proc.stderr());
+    let base = format!("http://127.0.0.1:{port}");
     let http = client();
-    // The port is bound before the server runs, so a probe can connect and
-    // then wait forever: bound each probe and the whole wait.
     let deadline = std::time::Instant::now() + common::PROCESS_TIMEOUT;
     while std::time::Instant::now() < deadline {
         let probe = http

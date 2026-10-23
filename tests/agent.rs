@@ -122,18 +122,23 @@ async fn start_api(dir: &Path, audit: &Path) -> (CliProcess, String) {
         token_table(&[("mcp-svc", common::SERVICE_TOKEN, "countdowns:read")]),
     )
     .unwrap();
-    let addr = format!("127.0.0.1:{}", common::free_port());
     let api = CliProcess::spawn(&[
         "-c".as_ref(),
         config.as_os_str(),
         "--api".as_ref(),
-        addr.as_ref(),
+        "127.0.0.1:0".as_ref(),
         "--api-tokens".as_ref(),
         table.as_os_str(),
         "--audit-log".as_ref(),
         audit.as_os_str(),
     ]);
-    let base = format!("http://{addr}");
+    assert!(
+        api.wait_for_stderr("countdown API listening on"),
+        "{}",
+        api.stderr()
+    );
+    let port = common::parse_listening_port(&api.stderr());
+    let base = format!("http://127.0.0.1:{port}");
     let http = common::http_client();
     let deadline = Instant::now() + common::PROCESS_TIMEOUT;
     while Instant::now() < deadline {

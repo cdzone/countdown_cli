@@ -254,6 +254,8 @@ Anthropic / AWS 工具写法强调：description 写清「做什么 / 何时用 
 - [ ] **错配夹具：** 验收含一列「新消费方 + 旧生产方」（配对绿不够）。
 - [ ] **模型出站视图：** 只留 unambiguous 字段；双语义字段勿并列回给模型。
 - [ ] **行为变就升版：** bump 应用版本 + `serverInfo`；文档硬矛盾同闸清。
+- [ ] **模型出站：** 本周期锚（`target_time` / `remaining_seconds`）与下次发生（`next_*`）**勿并列**回模型；模型视图用单独类型，勿在 API 解析 DTO 上堆 `skip_serializing`。
+
 
 ## 6. 已知限制与后续
 
@@ -266,7 +268,7 @@ Anthropic / AWS 工具写法强调：description 写清「做什么 / 何时用 
 
 ### 6.2 流程待办（A，`countdown-backlog.md`）
 
-- **P1 结构化错误（已落地 0.7.3）：** 见下方 §6.4。
+- **错误契约（0.7.3 结构化码 → **0.8.0** 方案 A）：** 见下方 §6.4（HTTP 自枚举 + MCP 映射；契约快照；ModelView 无 `target_time`）。
 - **MCP 客户端接入调研**（Cursor / CodeBuddy / Codex：Authorization 头、每工具令牌、skill/rules）：待排期后再开；本文件不展开。
 - 其他前端形态（后台服务等）；网页只是 AG-UI 的一种。
 - backlog 里另有 0.5.1 通知超时、审计方法名截断、P1 annotations 等，与主线无关。
@@ -275,32 +277,43 @@ Anthropic / AWS 工具写法强调：description 写清「做什么 / 何时用 
 
 1. **未在本机重跑** 1.89/1.99.1 全测与 clippy（仅见既有日志副本，未复跑）。
 2. **未打开** 远端 GitHub Actions 原始日志；CI 称绿处本文不重复断言。
-3. **`web/package.json` 仍标 0.7.0**：与 crate 0.7.3 不一致是否有意，未问产品方。
+3. **`web/package.json` 仍标 0.7.0**：与 crate 0.8.0 不一致是否有意，未问产品方。
 4. **Anthropic「合并相关操作为更少工具」** 与「按意图拆工具」存在张力：本 MVP 选择拆开以避免模型从 list 猜；是否对所有业务成立未做对照实验（C）。
 5. **外部 IDE 接 MCP** 未在本轮实测（留给后续排期后的调研）。
-6. 本地 worktree 的 `HEAD` 可能落后；以已合入的 `origin/master` 为准（P0 后 tip 曾为 `2250cd3` / 树 `9c2a66e5`；0.7.2 后再叠 0.7.3）。
+6. 本地 worktree 的 `HEAD` 可能落后；以已合入的 `origin/master` 为准（P0 后 tip 曾为 `2250cd3` / 树 `9c2a66e5`；0.7.3 后再叠 0.8.0（mbox / 未合 master 前以分支为准））。
 
-### 6.4 错误契约（结构化错误，**0.7.3 已落地**）
+### 6.4 错误契约（结构化错误；**0.8.0 已落地，方案 A**）
 
-> 依据：调研对照文 sha `3c84baf8…`（RFC 9457 / JSON-RPC / MCP Tools）；实现与 HTTP↔MCP 共用 `countdown_cli::error::ErrorCode`。
+> 依据：第三方第二轮 + 群内拍「一次 0.8.0」；实现见 `HttpErrorCode` / `ErrorCode`（`src/error.rs`）与 `ApiCountdown`→`ModelCountdown`（`src/bin/countdown_mcp.rs`）。**废止**「HTTP↔MCP 共用同一词表 / API 直接吃 ErrorCode」旧表述。
 
-**形状：**
+**形状（方案 A）：**
 
-- HTTP：`{ "error": { "code": "…", "message": "…" } }`（P1 不强制 `problem+json`）。
-- MCP：业务失败保留 `isError:true`；`content` = 人读句；**`structuredContent.error = { code, message }`**；业务失败**不**升 JSON-RPC protocol error。
-- 共用应用级 code 表：`not_found` / `invalid_argument` / `unauthenticated` / `permission_denied` / `contract_mismatch` / `upstream_unavailable` / `internal`。鉴权体码：原 `unauthorized`→`unauthenticated`，原 `forbidden`→`permission_denied`（审计 `outcome` 仍可写 `forbidden` 等，与应用码分家）。
-- 细粒度校验码（如 `invalid_datetime` / `invalid_body`）仍可出现在 HTTP；属 `invalid_argument` 族，增删改同样升版。
-- Agent / 夹具：**只断言 `code`**，禁止 message 子串分支。人读文案对外可统一「查不到」，机读码必须区分 `not_found` / `unauthenticated` / `permission_denied` / `contract_mismatch` 等。
-- 本仓工具**未声明 `outputSchema`**，错误信封与成功 JSON 文本并存不冲突；若日后声明 schema，须在规格写清错误路径如何共存后再加。
+| 层 | 码表 | 出站 |
+|---|---|---|
+| HTTP/API | **`HttpErrorCode` 自有枚举**；401/403 体码**改回**历史串 `unauthorized` / `forbidden`（0.7.3 曾改为 `unauthenticated` / `permission_denied`）；另含 `invalid_*` / `payload_too_large` 等 | `{ "error": { "code": "<http码>", "message": "…" } }` |
+| MCP 边界 | `HttpErrorCode::to_mcp` **穷尽**映射到 `ErrorCode`（各 `invalid_*` / `payload_too_large` → `invalid_argument`）；漏臂编译失败 | `isError:true`；`content` = 固定短文案（**不透传**上游 body）；`structuredContent.error = { code, message }` 用 **ErrorCode** |
+| Agent / 夹具 | 只认 `ErrorCode` | **只断言 `code`**，禁止 message 子串 |
 
-**与空/错：** 诚实空仍是成功+明确空（如 `get_next` → `{"countdown":null}`）；契约缺字段仍 fail-closed → `contract_mismatch`。不改变 §5.6 出门清单。
+- 业务失败**不**升 JSON-RPC protocol error。
+- `ErrorCode::parse` **不再**接受 `unauthorized` / `forbidden` 别名（体码回旧名后由 HTTP 枚举 + 映射承担）。
+- 审计 `Record` 可带 `code`（写 `ErrorCode::as_str()`）。**偏离一句：** 审计 outcome 对 401 仍可写 `unauthenticated`，与 HTTP body 的 `unauthorized` 分家——有意为之。
+- 人读文案对外可统一「查不到」；机读码在 MCP 侧区分 `not_found` / `invalid_argument` / `unauthenticated` / `permission_denied` / `contract_mismatch` / `upstream_unavailable` / `internal`。
+- 本仓工具**未声明 `outputSchema`**；若日后声明，须先写清错误路径如何共存。
 
-**未做：** MCP tool `annotations`（旧 P1 F）；RFC 9457 `problem+json` 全量字段。
+**同闸已钉（0.8.0）：**
+
+1. 契约快照闸：`tests/contract_snapshots.rs` + `tests/fixtures/{http-error-bodies,mcp-tool-outputs,mcp-tools}.json`；变更须同步 CHANGELOG / 版号。
+2. 模型视图单独类型：`ApiCountdown`（Deserialize，可含 `target_time`）→ `into_model()` → `ModelCountdown`（**无** `target_time`）；勿在 API DTO 上堆 `skip_serializing` 充模型视图。
+3. CHANGELOG + Cargo / `serverInfo` → **0.8.0**。
+
+**与空/错：** 诚实空仍成功+明确空；契约缺字段仍 fail-closed → `contract_mismatch`。不改变 §5.6。
+
+**本闸未做 / 之后：** 启动硬失败、Agent 按码分流、docs「双通道」句（约 L381）二选一、annotations、真模型验收（可同批或紧随）、RFC 9457 `problem+json` 全量字段。
 
 
 ## 7. Rust / MCP 实现取舍
 
-> 本章只谈实现：crate / bin 边界、MCP 工具怎么钉行为、测试钉什么。产品闸门、令牌运维、网页验收口径见其他章。基线：公开仓库 `cdzone/countdown_cli` crate **0.7.3**（MSRV 1.89，单 crate 多 bin）。
+> 本章只谈实现：crate / bin 边界、MCP 工具怎么钉行为、测试钉什么。产品闸门、令牌运维、网页验收口径见其他章。基线：公开仓库 `cdzone/countdown_cli` crate **0.8.0**（MSRV 1.89，单 crate 多 bin）。
 
 ### 7.1 本章范围
 

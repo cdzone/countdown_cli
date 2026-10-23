@@ -1,0 +1,53 @@
+{
+  "tools": [
+    {
+      "description": "Get one countdown by id. Returns id, title, next_target_time, next_remaining_seconds, repeat, enabled, and a server-computed expired flag (based on next_remaining_seconds). For how long until / next fire, use next_* only. Use when the id is already known.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "id": {
+            "description": "Countdown id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "get_countdown"
+    },
+    {
+      "description": "Return the single nearest countdown that has not expired yet (next_remaining_seconds >= 0), chosen by the server. Use when the user asks which is next, nearest, soon due, or how long until the next one — read next_target_time / next_remaining_seconds on the result. Do not use list_countdowns for that. If none are upcoming, returns {\"countdown\":null} — do not pick an expired one.",
+      "inputSchema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "get_next_countdown"
+    },
+    {
+      "description": "List countdowns sorted by next_remaining_seconds (upcoming first). Each item includes a server-computed expired flag (next_remaining_seconds < 0). Use when the user asks what exists, which have expired, or wants to browse. Do not use this to answer which is nearest/next — call get_next_countdown instead. For how long until / next fire, use next_target_time and next_remaining_seconds. Returns id, title, next_target_time, next_remaining_seconds, repeat, enabled, expired.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "include_disabled": {
+            "default": false,
+            "description": "Include disabled countdowns (default false)",
+            "type": "boolean"
+          },
+          "within_hours": {
+            "description": "Only return countdowns due within this many hours (0 <= next_remaining_seconds <= within_hours*3600)",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "name": "list_countdowns"
+    }
+  ]
+}

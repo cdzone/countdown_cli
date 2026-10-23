@@ -15,8 +15,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --check
+      - name: cargo clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: cargo test
+        run: cargo test --locked
+
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo clippy (MSRV 1.89)
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: cargo test (MSRV 1.89)
         run: cargo test --locked
 
   web:

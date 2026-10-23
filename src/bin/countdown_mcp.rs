@@ -23,7 +23,7 @@ use clap::Parser;
 use countdown_cli::{
     audit::{truncated, AuditLog},
     auth::{bearer_challenge, read_token_file, TokenFileError, TokenTable},
-    error::ErrorCode,
+    error::{ErrorCode, HttpErrorCode},
 };
 use rmcp::{
     handler::server::{tool::Extension, wrapper::Parameters},
@@ -148,6 +148,9 @@ struct Record<'a> {
     is_error: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     upstream_status: Option<u16>,
+    /// Application error code when the tool failed (MCP ErrorCode wire form).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'a str>,
     duration_ms: u64,
 }
 
@@ -209,6 +212,7 @@ impl Upstream {
         outcome: Outcome,
         is_error: Option<bool>,
         upstream_status: Option<reqwest::StatusCode>,
+        code: Option<ErrorCode>,
     ) {
         write_audit(
             audit,
@@ -226,6 +230,7 @@ impl Upstream {
                 status: None,
                 is_error,
                 upstream_status: upstream_status.map(|s| s.as_u16()),
+                code: code.map(ErrorCode::as_str),
                 duration_ms: self.started.elapsed().as_millis() as u64,
             },
         );
@@ -240,11 +245,17 @@ impl Upstream {
     ) -> Result<CallToolResult, McpError> {
         let mut result = match result {
             Ok(r) => {
-                self.record(audit, Outcome::Ok, Some(false), None);
+                self.record(audit, Outcome::Ok, Some(false), None, None);
                 r
             }
             Err(f) => {
-                self.record(audit, f.outcome, Some(true), f.upstream_status);
+                self.record(
+                    audit,
+                    f.outcome,
+                    Some(true),
+                    f.upstream_status,
+                    Some(f.code),
+                );
                 tool_error(f.code, f.message)
             }
         };
@@ -342,6 +353,7 @@ impl Entry {
                 status: Some(status.as_u16()),
                 is_error: None,
                 upstream_status: None,
+                code: None,
                 duration_ms: started.elapsed().as_millis() as u64,
             },
         );
@@ -422,56 +434,79 @@ where
     Option::<T>::deserialize(deserializer)
 }
 
-/// Fields of the API's countdown object that the tools expose, plus a
-/// server-computed `expired` flag (the API does not send it).
+/// Strict deserialization of one countdown object from the HTTP API.
 ///
-/// `next_*` must appear in the API JSON (value may be null). `remaining_seconds`
-/// is accepted from the API for diagnostics but **not** serialized back to the
-/// model — Agents must use `next_*` for "how long until / next occurrence".
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct Countdown {
+/// Kept separate from [`ModelCountdown`]: parsing stays strict (required
+/// `next_*` keys); the model never sees this type.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+struct ApiCountdown {
     id: String,
     title: String,
+    #[serde(default)]
     target_time: Option<String>,
-    /// Elapsed/display field from API; skipped on the way out to the model.
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     remaining_seconds: Option<i64>,
-    /// Next occurrence (from API `next_*`); used for Agent pick/expired/window.
     #[serde(deserialize_with = "require_option")]
     next_target_time: Option<String>,
     #[serde(deserialize_with = "require_option")]
     next_remaining_seconds: Option<i64>,
     repeat: Option<String>,
     enabled: bool,
+}
+
+/// Outbound shape for MCP tools — only fields the model should read.
+/// Built by explicit conversion from [`ApiCountdown`] (no `skip_serializing`
+/// on the API DTO).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct ModelCountdown {
+    id: String,
+    title: String,
+    next_target_time: Option<String>,
+    next_remaining_seconds: Option<i64>,
+    repeat: Option<String>,
+    enabled: bool,
     /// `true` when `next_remaining_seconds` is negative. `None` is treated as
     /// not expired (honest: the API could not compute a next target).
-    #[serde(default)]
     expired: bool,
+}
+
+impl ApiCountdown {
+    fn into_model(self) -> ModelCountdown {
+        let expired = matches!(self.next_remaining_seconds, Some(s) if s < 0);
+        ModelCountdown {
+            id: self.id,
+            title: self.title,
+            next_target_time: self.next_target_time,
+            next_remaining_seconds: self.next_remaining_seconds,
+            repeat: self.repeat,
+            enabled: self.enabled,
+            expired,
+        }
+    }
 }
 
 /// Shape returned by `get_next_countdown`: one item or an explicit empty.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct NextCountdown {
-    countdown: Option<Countdown>,
+    countdown: Option<ModelCountdown>,
 }
 
-fn annotate(mut c: Countdown) -> Countdown {
-    c.expired = matches!(c.next_remaining_seconds, Some(s) if s < 0);
-    c
-}
-
-fn is_upcoming(c: &Countdown) -> bool {
+fn is_upcoming(c: &ApiCountdown) -> bool {
     matches!(c.next_remaining_seconds, Some(s) if s >= 0)
 }
 
 /// Among items with `next_remaining_seconds >= 0`, pick the smallest next remaining.
 /// Recurring items use API `next_*` (rolled forward), so a Daily/Weekday that
 /// already passed today's clock is still upcoming until it has no next fire.
-fn pick_next(items: impl IntoIterator<Item = Countdown>) -> Option<Countdown> {
-    items.into_iter().filter(is_upcoming).min_by_key(|c| {
-        c.next_remaining_seconds
-            .expect("is_upcoming guarantees Some")
-    })
+fn pick_next(items: impl IntoIterator<Item = ApiCountdown>) -> Option<ModelCountdown> {
+    items
+        .into_iter()
+        .filter(is_upcoming)
+        .min_by_key(|c| {
+            c.next_remaining_seconds
+                .expect("is_upcoming guarantees Some")
+        })
+        .map(ApiCountdown::into_model)
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -526,13 +561,13 @@ fn json_result<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
 }
 
-fn due_within(c: &Countdown, hours: u32) -> bool {
+fn due_within(c: &ApiCountdown, hours: u32) -> bool {
     let limit = i64::from(hours) * 3600;
     matches!(c.next_remaining_seconds, Some(s) if (0..=limit).contains(&s))
 }
 
 /// Sort for the model: upcoming by `next_remaining_seconds` asc, then expired, then unknown.
-fn sort_for_model(items: &mut [Countdown]) {
+fn sort_for_model(items: &mut [ModelCountdown]) {
     items.sort_by_key(|c| match c.next_remaining_seconds {
         Some(s) if s >= 0 => (0u8, s),
         Some(s) => (1u8, s),
@@ -632,8 +667,9 @@ impl CountdownMcp {
         }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            // Prefer a known application code from the body on 4xx; 5xx stays
-            // `internal` so a mislabeled upstream body cannot mask server faults.
+            // Prefer a known HTTP application code from the body on 4xx; map it
+            // to ErrorCode at the boundary. 5xx stays `internal`. The upstream
+            // body never reaches the model — only a fixed short message.
             let code = if status.is_server_error() {
                 ErrorCode::Internal
             } else {
@@ -643,15 +679,16 @@ impl CountdownMcp {
                         v.get("error")
                             .and_then(|e| e.get("code"))
                             .and_then(|c| c.as_str())
-                            .and_then(ErrorCode::parse)
+                            .and_then(HttpErrorCode::parse)
                     })
+                    .map(HttpErrorCode::to_mcp)
                     .unwrap_or(ErrorCode::Internal)
             };
             return Err(fail(
                 Outcome::Error,
                 Some(status),
                 code,
-                format!("countdown API returned {status}: {body}"),
+                format!("countdown API returned {status}"),
             ));
         }
         resp.json::<T>().await.map_err(|e| {
@@ -673,17 +710,23 @@ impl CountdownMcp {
         let status = match self.get(url, &up).timeout(PROBE_TIMEOUT).send().await {
             Ok(resp) => resp.status(),
             Err(_) => {
-                up.record(&self.audit, Outcome::UpstreamUnreachable, None, None);
+                up.record(&self.audit, Outcome::UpstreamUnreachable, None, None, None);
                 return Probe::Accepted;
             }
         };
         match status {
             reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
-                up.record(&self.audit, Outcome::UpstreamAuthFailed, None, Some(status));
+                up.record(
+                    &self.audit,
+                    Outcome::UpstreamAuthFailed,
+                    None,
+                    Some(status),
+                    None,
+                );
                 Probe::Rejected(status)
             }
             s if !s.is_success() => {
-                up.record(&self.audit, Outcome::Error, None, Some(s));
+                up.record(&self.audit, Outcome::Error, None, Some(s), None);
                 Probe::Accepted
             }
             _ => Probe::Accepted,
@@ -691,7 +734,7 @@ impl CountdownMcp {
     }
 
     #[tool(
-        description = "List countdowns sorted by next_remaining_seconds (upcoming first). Each item includes a server-computed expired flag (next_remaining_seconds < 0). Use when the user asks what exists, which have expired, or wants to browse. Do not use this to answer which is nearest/next — call get_next_countdown instead. For how long until / next fire, use next_target_time and next_remaining_seconds only (not target_time alone). Returns id, title, target_time, next_target_time, next_remaining_seconds, repeat, enabled, expired."
+        description = "List countdowns sorted by next_remaining_seconds (upcoming first). Each item includes a server-computed expired flag (next_remaining_seconds < 0). Use when the user asks what exists, which have expired, or wants to browse. Do not use this to answer which is nearest/next — call get_next_countdown instead. For how long until / next fire, use next_target_time and next_remaining_seconds. Returns id, title, next_target_time, next_remaining_seconds, repeat, enabled, expired."
     )]
     async fn list_countdowns(
         &self,
@@ -708,17 +751,15 @@ impl CountdownMcp {
             url.query_pairs_mut().append_pair("enabled", "true");
         }
         let result = self
-            .fetch::<Vec<Countdown>>(url, &up)
+            .fetch::<Vec<ApiCountdown>>(url, &up)
             .await
             .and_then(|items| {
-                let mut items: Vec<Countdown> = match args.within_hours {
-                    Some(h) => items
-                        .into_iter()
-                        .filter(|c| due_within(c, h))
-                        .map(annotate)
-                        .collect(),
-                    None => items.into_iter().map(annotate).collect(),
+                let filtered: Vec<ApiCountdown> = match args.within_hours {
+                    Some(h) => items.into_iter().filter(|c| due_within(c, h)).collect(),
+                    None => items,
                 };
+                let mut items: Vec<ModelCountdown> =
+                    filtered.into_iter().map(ApiCountdown::into_model).collect();
                 sort_for_model(&mut items);
                 json_result(&items).map_err(|e| Failure {
                     outcome: Outcome::Error,
@@ -731,7 +772,7 @@ impl CountdownMcp {
     }
 
     #[tool(
-        description = "Get one countdown by id. Returns id, title, target_time, next_target_time, next_remaining_seconds, repeat, enabled, and a server-computed expired flag (based on next_remaining_seconds). For how long until / next fire, use next_* only. Use when the id is already known."
+        description = "Get one countdown by id. Returns id, title, next_target_time, next_remaining_seconds, repeat, enabled, and a server-computed expired flag (based on next_remaining_seconds). For how long until / next fire, use next_* only. Use when the id is already known."
     )]
     async fn get_countdown(
         &self,
@@ -741,10 +782,10 @@ impl CountdownMcp {
         let params = serde_json::json!({ "id": id });
         let up = Upstream::new("tool:get_countdown", Some(&parts), Some(&id), params);
         let result = match self
-            .fetch::<Countdown>(self.endpoint(&["countdowns", &id]), &up)
+            .fetch::<ApiCountdown>(self.endpoint(&["countdowns", &id]), &up)
             .await
         {
-            Ok(item) => json_result(&annotate(item)).map_err(|e| Failure {
+            Ok(item) => json_result(&item.into_model()).map_err(|e| Failure {
                 outcome: Outcome::Error,
                 upstream_status: None,
                 code: ErrorCode::Internal,
@@ -774,11 +815,11 @@ impl CountdownMcp {
         let mut url = self.endpoint(&["countdowns"]);
         url.query_pairs_mut().append_pair("enabled", "true");
         let result = self
-            .fetch::<Vec<Countdown>>(url, &up)
+            .fetch::<Vec<ApiCountdown>>(url, &up)
             .await
             .and_then(|items| {
                 let next = NextCountdown {
-                    countdown: pick_next(items.into_iter().map(annotate)),
+                    countdown: pick_next(items),
                 };
                 json_result(&next).map_err(|e| Failure {
                     outcome: Outcome::Error,
@@ -850,9 +891,13 @@ async fn main() {
         eprintln!("{}; check --api-token-file", rejected_credential(status));
         std::process::exit(2);
     }
+    let bound = listener.local_addr().unwrap_or_else(|e| {
+        eprintln!("failed to read bound address: {e}");
+        std::process::exit(1);
+    });
     let entry = Arc::new(Entry { tokens, audit });
-    let router = app(mcp, entry, args.addr.port());
-    eprintln!("countdown_mcp listening on http://{}/mcp", args.addr);
+    let router = app(mcp, entry, bound.port());
+    eprintln!("countdown_mcp listening on http://{bound}/mcp");
     if let Err(e) = axum::serve(listener, router).await {
         eprintln!("server error: {e}");
         std::process::exit(1);
@@ -962,7 +1007,7 @@ mod tests {
     }
 
     fn ids(r: &CallToolResult) -> Vec<String> {
-        let v: Vec<Countdown> = serde_json::from_str(&text(r)).unwrap();
+        let v: Vec<ModelCountdown> = serde_json::from_str(&text(r)).unwrap();
         v.into_iter().map(|c| c.id).collect()
     }
 
@@ -1001,6 +1046,47 @@ mod tests {
         parts(None)
     }
 
+    #[test]
+    fn mcp_tools_list_matches_fixture() {
+        let tools = CountdownMcp::tool_router().list_all();
+        let mut slim: Vec<serde_json::Value> = tools
+            .into_iter()
+            .map(|t| {
+                serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "inputSchema": t.input_schema,
+                })
+            })
+            .collect();
+        slim.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        let actual = serde_json::json!({ "tools": slim });
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp-tools.json");
+        if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
+            std::fs::write(&path, serde_json::to_string_pretty(&actual).unwrap() + "\n").unwrap();
+            return;
+        }
+        let expected: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            expected, actual,
+            "mcp-tools.json drifted — update fixture + CHANGELOG + version together"
+        );
+        // Hard guard: descriptions must not advertise the elapsed field
+        // `target_time` (substring of `next_target_time` is fine).
+        for t in actual["tools"].as_array().unwrap() {
+            let desc = t["description"].as_str().unwrap_or("");
+            assert!(
+                !desc.contains("title, target_time")
+                    && !desc.contains("not target_time")
+                    && !desc.contains("Returns id, title, target_time"),
+                "{} description still advertises target_time: {desc}",
+                t["name"]
+            );
+        }
+    }
+
     #[tokio::test]
     async fn unreachable_api_is_tool_error_not_protocol_error() {
         let mcp = mcp(unreachable_url().await);
@@ -1026,7 +1112,8 @@ mod tests {
         assert_eq!(r.is_error, Some(false));
         let raw: Value = serde_json::from_str(&text(&r)).unwrap();
         assert!(raw.get("remaining_seconds").is_none(), "{raw}");
-        let c: Countdown = serde_json::from_value(raw).unwrap();
+        assert!(raw.get("target_time").is_none(), "{raw}");
+        let c: ModelCountdown = serde_json::from_value(raw).unwrap();
         assert_eq!(c.next_remaining_seconds, Some(3600));
         assert!(!c.expired);
     }
@@ -1071,7 +1158,7 @@ mod tests {
             .list_countdowns(list(None, false), anon())
             .await
             .unwrap();
-        let items: Vec<Countdown> = serde_json::from_str(&text(&r)).unwrap();
+        let items: Vec<ModelCountdown> = serde_json::from_str(&text(&r)).unwrap();
         let by_id: std::collections::HashMap<_, _> =
             items.into_iter().map(|c| (c.id.clone(), c)).collect();
         assert!(by_id["past"].expired);
@@ -1090,7 +1177,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .all(|v| v.get("remaining_seconds").is_none()));
+            .all(|v| { v.get("remaining_seconds").is_none() && v.get("target_time").is_none() }));
     }
 
     #[tokio::test]
@@ -1105,6 +1192,7 @@ mod tests {
         assert!(!c.expired);
         let raw: Value = serde_json::from_str(&text(&r)).unwrap();
         assert!(raw["countdown"].get("remaining_seconds").is_none(), "{raw}");
+        assert!(raw["countdown"].get("target_time").is_none(), "{raw}");
     }
 
     #[tokio::test]
@@ -1139,7 +1227,7 @@ mod tests {
             .list_countdowns(list(None, false), anon())
             .await
             .unwrap();
-        let items: Vec<Countdown> = serde_json::from_str(&text(&r)).unwrap();
+        let items: Vec<ModelCountdown> = serde_json::from_str(&text(&r)).unwrap();
         assert_eq!(items.len(), 3);
         assert!(items.iter().all(|c| c.expired));
         assert!(items.iter().any(|c| c.id == "past_oneshot_extra"));
@@ -1156,7 +1244,7 @@ mod tests {
     #[test]
     fn pick_next_skips_negative_and_none() {
         let items = vec![
-            annotate(Countdown {
+            ApiCountdown {
                 id: "past".into(),
                 title: "past".into(),
                 target_time: Some("t".into()),
@@ -1166,9 +1254,8 @@ mod tests {
                 // Oneshot: recurring next_* would not stay negative.
                 repeat: None,
                 enabled: true,
-                expired: false,
-            }),
-            annotate(Countdown {
+            },
+            ApiCountdown {
                 id: "none".into(),
                 title: "none".into(),
                 target_time: None,
@@ -1177,9 +1264,8 @@ mod tests {
                 next_remaining_seconds: None,
                 repeat: None,
                 enabled: true,
-                expired: false,
-            }),
-            annotate(Countdown {
+            },
+            ApiCountdown {
                 id: "soon".into(),
                 title: "soon".into(),
                 target_time: Some("t".into()),
@@ -1188,9 +1274,8 @@ mod tests {
                 next_remaining_seconds: Some(10),
                 repeat: None,
                 enabled: true,
-                expired: false,
-            }),
-            annotate(Countdown {
+            },
+            ApiCountdown {
                 id: "later".into(),
                 title: "later".into(),
                 target_time: Some("t".into()),
@@ -1199,8 +1284,7 @@ mod tests {
                 next_remaining_seconds: Some(100),
                 repeat: None,
                 enabled: true,
-                expired: false,
-            }),
+            },
         ];
         let next = pick_next(items).unwrap();
         assert_eq!(next.id, "soon");
@@ -1252,12 +1336,13 @@ mod tests {
         // Model view omits remaining_seconds; next_* is the answer for "how long".
         let raw_next: Value = serde_json::from_str(&text(&r)).unwrap();
         assert!(raw_next["countdown"].get("remaining_seconds").is_none());
+        assert!(raw_next["countdown"].get("target_time").is_none());
 
         let r = mcp
             .list_countdowns(list(None, false), anon())
             .await
             .unwrap();
-        let items: Vec<Countdown> = serde_json::from_str(&text(&r)).unwrap();
+        let items: Vec<ModelCountdown> = serde_json::from_str(&text(&r)).unwrap();
         // Upcoming-first sort: daily (21h) before weekday (21h+60) before oneshot (7d).
         assert_eq!(
             items.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
@@ -1306,7 +1391,7 @@ mod tests {
             "repeat": null,
             "enabled": true
         });
-        let err = serde_json::from_value::<Countdown>(v).unwrap_err();
+        let err = serde_json::from_value::<ApiCountdown>(v).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("next_target_time") || msg.contains("next_remaining_seconds"),
@@ -1325,11 +1410,11 @@ mod tests {
             "repeat": null,
             "enabled": true
         });
-        let c: Countdown = serde_json::from_value(v).unwrap();
+        let c: ApiCountdown = serde_json::from_value(v).unwrap();
         assert_eq!(c.next_remaining_seconds, None);
         assert_eq!(c.next_target_time, None);
         assert!(!is_upcoming(&c));
-        assert!(pick_next(std::iter::once(annotate(c))).is_none());
+        assert!(pick_next(std::iter::once(c)).is_none());
     }
 
     #[tokio::test]
@@ -1509,7 +1594,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn other_api_errors_still_pass_the_body_through() {
+    async fn other_api_errors_use_fixed_text_without_api_body() {
         let (url, _) = recording_api(StatusCode::INTERNAL_SERVER_ERROR, SECRET_BODY).await;
         let r = mcp(url)
             .list_countdowns(list(None, false), anon())
@@ -1517,9 +1602,8 @@ mod tests {
             .unwrap();
         assert_eq!(r.is_error, Some(true));
         assert_eq!(error_code_of(&r), Some("internal"));
-        // Message may still carry the upstream body for operators; code is what
-        // clients branch on.
-        assert!(text(&r).contains("BODY-MARKER"), "{}", text(&r));
+        assert_eq!(text(&r), "countdown API returned 500 Internal Server Error");
+        assert!(!text(&r).contains("BODY-MARKER"), "{}", text(&r));
     }
 
     #[tokio::test]

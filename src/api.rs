@@ -13,6 +13,7 @@ use chrono::{Local, NaiveDateTime};
 use countdown_cli::{
     audit::{truncated, AuditLog},
     auth::{bearer_challenge, Principal, Scope, TokenTable},
+    error::HttpErrorCode,
     CountdownUpdateError,
 };
 use serde_json::{json, Value};
@@ -86,10 +87,10 @@ pub struct ApiErrorInner {
     pub message: String,
 }
 
-fn api_error(code: &'static str, message: impl Into<String>, status: StatusCode) -> Response {
+fn api_error(code: HttpErrorCode, message: impl Into<String>, status: StatusCode) -> Response {
     let body = ApiErrorBody {
         error: ApiErrorInner {
-            code,
+            code: code.as_str(),
             message: message.into(),
         },
     };
@@ -97,7 +98,11 @@ fn api_error(code: &'static str, message: impl Into<String>, status: StatusCode)
 }
 
 fn internal_error<E: std::fmt::Display>(e: E) -> Response {
-    api_error("internal", e.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
+    api_error(
+        HttpErrorCode::Internal,
+        e.to_string(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
 }
 
 #[derive(Clone)]
@@ -195,7 +200,11 @@ impl AuthFail {
         };
         let challenge = bearer_challenge(invalid_token, Some(Scope::CountdownsRead));
         with_challenge(
-            api_error("unauthenticated", message, StatusCode::UNAUTHORIZED),
+            api_error(
+                HttpErrorCode::Unauthorized,
+                message,
+                StatusCode::UNAUTHORIZED,
+            ),
             challenge,
         )
     }
@@ -230,7 +239,7 @@ fn forbidden(scope: Option<Scope>) -> Response {
     };
     with_challenge(
         api_error(
-            "permission_denied",
+            HttpErrorCode::Forbidden,
             "insufficient scope",
             StatusCode::FORBIDDEN,
         ),
@@ -387,7 +396,7 @@ async fn guard(State(gate): State<Gate>, req: Request, next: Next) -> Response {
     let (parts, body) = req.into_parts();
     let Ok(body) = to_bytes(body, MAX_BODY).await else {
         let res = api_error(
-            "payload_too_large",
+            HttpErrorCode::PayloadTooLarge,
             "request body too large",
             StatusCode::PAYLOAD_TOO_LARGE,
         );
@@ -398,7 +407,7 @@ async fn guard(State(gate): State<Gate>, req: Request, next: Next) -> Response {
     // No attempt line, no write: an unrecorded change must not happen.
     if gate.audit.append(&line).is_err() {
         return api_error(
-            "audit_unavailable",
+            HttpErrorCode::AuditUnavailable,
             "audit log unavailable",
             StatusCode::INTERNAL_SERVER_ERROR,
         );
@@ -438,7 +447,11 @@ async fn get_countdown(State(state): State<ApiState>, Path(id): Path<String>) ->
             return Json(api).into_response();
         }
     }
-    api_error("not_found", "Countdown not found", StatusCode::NOT_FOUND)
+    api_error(
+        HttpErrorCode::NotFound,
+        "Countdown not found",
+        StatusCode::NOT_FOUND,
+    )
 }
 
 fn parse_repeat(s: &str) -> Option<RepeatMode> {
@@ -451,20 +464,23 @@ fn parse_repeat(s: &str) -> Option<RepeatMode> {
 
 fn validate_and_build_domain(
     body: &CreateOrUpdateRequest,
-) -> Result<(String, bool, Option<RepeatMode>), (&'static str, String)> {
+) -> Result<(String, bool, Option<RepeatMode>), (HttpErrorCode, String)> {
     if body.title.trim().is_empty() {
-        return Err(("invalid_body", "title must not be empty".into()));
+        return Err((HttpErrorCode::InvalidBody, "title must not be empty".into()));
     }
     // datetime format
     if NaiveDateTime::parse_from_str(&body.datetime, "%Y-%m-%d %H:%M:%S").is_err() {
-        return Err(("invalid_datetime", "invalid datetime format".into()));
+        return Err((
+            HttpErrorCode::InvalidDatetime,
+            "invalid datetime format".into(),
+        ));
     }
     // repeat
     let repeat = match &body.repeat {
         None => Ok(None),
         Some(s) => parse_repeat(s)
             .map(Some)
-            .ok_or(("invalid_repeat", "invalid repeat".into())),
+            .ok_or((HttpErrorCode::InvalidRepeat, "invalid repeat".into())),
     }?;
     Ok((body.title.clone(), body.enabled, repeat))
 }
@@ -532,9 +548,11 @@ async fn update_countdown(
             let api = ApiCountdown::from_domain(&updated, now).unwrap();
             Json(api).into_response()
         }
-        Err(CountdownUpdateError::NotFound) => {
-            api_error("not_found", "Countdown not found", StatusCode::NOT_FOUND)
-        }
+        Err(CountdownUpdateError::NotFound) => api_error(
+            HttpErrorCode::NotFound,
+            "Countdown not found",
+            StatusCode::NOT_FOUND,
+        ),
         Err(CountdownUpdateError::Other(e)) => internal_error(e),
     }
 }
@@ -545,7 +563,11 @@ async fn delete_countdown(
 ) -> impl IntoResponse {
     match state.store.api_delete(&id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => api_error("not_found", "Countdown not found", StatusCode::NOT_FOUND),
+        Ok(false) => api_error(
+            HttpErrorCode::NotFound,
+            "Countdown not found",
+            StatusCode::NOT_FOUND,
+        ),
         Err(e) => internal_error(e),
     }
 }
@@ -1107,7 +1129,7 @@ datetime = "2026-12-31 00:00:00"
                 r.challenge(),
                 r#"Bearer realm="countdown", scope="countdowns:read""#
             );
-            assert_eq!(r.code(), "unauthenticated");
+            assert_eq!(r.code(), "unauthorized");
         }
         let lines = audit_lines(&path);
         assert_eq!(lines.len(), 5);
@@ -1128,7 +1150,7 @@ datetime = "2026-12-31 00:00:00"
         for uri in ["/countdowns", "/nope"] {
             let r = send(&router, "GET", uri, &[("authorization", &auth)], "").await;
             assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{uri}");
-            assert_eq!(r.code(), "unauthenticated");
+            assert_eq!(r.code(), "unauthorized");
             assert!(r.challenge().contains(r#"error="invalid_token""#));
             assert!(!r.body.contains(token));
         }
@@ -1189,7 +1211,7 @@ datetime = "2026-12-31 00:00:00"
         for (method, uri, body) in cases {
             let r = send(&router, method, uri, &[("authorization", READ_AUTH)], body).await;
             assert_eq!(r.status, StatusCode::FORBIDDEN, "{method} {body}");
-            assert_eq!(r.code(), "permission_denied");
+            assert_eq!(r.code(), "forbidden");
             assert_eq!(
                 r.challenge(),
                 r#"Bearer error="insufficient_scope", scope="countdowns:write""#
@@ -1229,7 +1251,7 @@ datetime = "2026-12-31 00:00:00"
             )
             .await;
             assert_eq!(r.status, StatusCode::FORBIDDEN, "{method} {uri}");
-            assert_eq!(r.code(), "permission_denied");
+            assert_eq!(r.code(), "forbidden");
             assert_eq!(r.challenge(), r#"Bearer error="insufficient_scope""#);
         }
         assert_eq!(fs::read(&path).unwrap(), before);
