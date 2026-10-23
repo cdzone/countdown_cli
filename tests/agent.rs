@@ -313,8 +313,12 @@ async fn tool_call_reaches_the_real_mcp_and_the_answer_names_the_countdown() {
         .iter()
         .map(|t| t["function"]["name"].as_str().unwrap())
         .collect();
-    assert_eq!(offered.len(), 2, "{offered:?}");
-    assert!(offered.contains(&"list_countdowns") && offered.contains(&"get_countdown"));
+    assert_eq!(offered.len(), 3, "{offered:?}");
+    assert!(
+        offered.contains(&"list_countdowns")
+            && offered.contains(&"get_countdown")
+            && offered.contains(&"get_next_countdown")
+    );
     assert_no_entry_token(&[
         &stdout,
         &stderr,

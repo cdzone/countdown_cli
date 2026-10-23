@@ -105,7 +105,7 @@ countdown_cli -c config.toml --api 127.0.0.1:8080 --api-tokens api-tokens.toml
 | `--api-url <URL>` | `COUNTDOWN_API_URL` | API 地址，默认 `http://127.0.0.1:8080` |
 | `--addr <地址>` | `COUNTDOWN_MCP_ADDR` | MCP 监听地址，默认 `127.0.0.1:8765`，只接受回环地址 |
 | `--api-token-file <路径>` | `COUNTDOWN_API_TOKEN_FILE` | MCP 服务令牌文件（3.2 节），必填 |
-| `--tokens <路径>` | `COUNTDOWN_MCP_TOKENS` | MCP 入口令牌表（3.1 节格式），必填。入口不看 scope，令牌有效即可调用两个只读工具；但每条仍须写合法的 `scopes`（如 `["countdowns:read"]`），否则令牌表校验不过 |
+| `--tokens <路径>` | `COUNTDOWN_MCP_TOKENS` | MCP 入口令牌表（3.1 节格式），必填。入口不看 scope，令牌有效即可调用三个只读工具；但每条仍须写合法的 `scopes`（如 `["countdowns:read"]`），否则令牌表校验不过 |
 | `--audit-log <路径>` | `COUNTDOWN_MCP_AUDIT_LOG` | MCP 审计文件，默认当前工作目录下的 `countdown-mcp-audit.jsonl`。**不要和 API 用同一个文件** |
 
 启动时 MCP 用服务令牌调一次 `GET /countdowns?enabled=true`：API 返回 401/403 就以退出码 2 退出；API 连不上照常启动（API 可能后起），审计里记一行 `outcome: upstream_unreachable`；API 返回其他非 2xx 也照常启动，记一行 `outcome: error`。探测成功不记。
@@ -117,6 +117,18 @@ countdown_mcp --api-token-file mcp-svc.token --tokens mcp-tokens.toml
 ```
 
 MCP 入口的 `Origin` 校验：请求不带 `Origin` 放行；带了但不是 `http://127.0.0.1:<MCP 端口>` 或 `http://localhost:<MCP 端口>`，即使令牌有效也返回 403。这个允许列表是固定的，没有参数可改。
+
+### 4.3 只读工具（`tools/list`）
+
+客户端连上后拿到的工具清单（名字 + `description` + 参数表）是模型选型的依据。本版三个工具：
+
+| 工具 | 用途 |
+|---|---|
+| `get_next_countdown` | 无参。服务端挑 `remaining_seconds >= 0` 且最小的一条；没有则返回 `{"countdown":null}`，不拿过期的充数。问「最近／下一个」用它。 |
+| `list_countdowns` | 默认仍返回全部（可用 `within_hours` / `include_disabled` 过滤）；每条带服务端算的 `expired`。问「有哪些／哪些过期了」用它；**不要**用它来猜最近。 |
+| `get_countdown` | 按 id 取一条。 |
+
+服务端 `initialize` 的 `instructions` 用三句话复述上述分工。工具无单独版号，行为变更随应用版本（如 `0.7.1`）发布。
 
 ## 5. 认证与失败返回
 
@@ -256,6 +268,7 @@ MCP_STORAGE_DIR=$(mktemp -d) npx @modelcontextprotocol/inspector@2.12.0 --cli \
 - 不做令牌热加载、限流、日志外送和服务内轮转；没有终端用户级别的权限，只认到「哪个程序在调」。
 - API 和 MCP 同写一个审计文件没有测过，不要这样配。
 - MCP 审计目前只记工具调用、启动探测异常和入口拒绝；规格要求的协议层请求（initialize、tools/list 等）的 `rpc:<方法>` 行本版还没有实现。
+- 每日重复的倒计时在当天目标时刻过后，API 给出的 `remaining_seconds` 仍为负数（目标时刻尚未滚到下一天）。`get_next_countdown` 会跳过它（不当「下一个」）；`list_countdowns` 仍返回它并标 `expired: true`，问「有哪些」不会少报。
 
 ## 11. 命令行智能体 `countdown_agent`
 
@@ -265,7 +278,7 @@ MCP_STORAGE_DIR=$(mktemp -d) npx @modelcontextprotocol/inspector@2.12.0 --cli \
                    └──Bearer(MCP 入口令牌)──▶ countdown_mcp ──▶ countdown_cli --api
 ```
 
-智能体只经 MCP 的两个只读工具 `list_countdowns`、`get_countdown` 取数，不直连 API，也不知道 API 地址。
+智能体只经 MCP 的三个只读工具 `list_countdowns`、`get_countdown`、`get_next_countdown` 取数，不直连 API，也不知道 API 地址。问「最近／下一个」时应走 `get_next_countdown`（由服务端挑一条未到期的）；问「有哪些／哪些过期了」走 `list_countdowns`（默认仍返回全部，每条带服务端算的 `expired`）。
 
 ### 11.1 准备
 
@@ -317,7 +330,7 @@ countdown_agent                          # 不带参数：一行一个问题，C
   ```
 
   `request_id` 由 MCP 在工具结果的 `_meta.request_id` 里返回，智能体不自己生成，可以拿它去对 MCP 和 API 的审计行。调用记录不含工具返回的数据和模型的文字。
-- 启动时先连 MCP 并列工具：连不上或缺 `list_countdowns` / `get_countdown`，stderr 输出一行 JSON 告警（`"level":"alert"`，`event` 为 `mcp_unavailable` 或 `mcp_tools_missing`），退出码 2。
+- 启动时先连 MCP 并列工具：连不上或缺 `list_countdowns` / `get_countdown` / `get_next_countdown`，stderr 输出一行 JSON 告警（`"level":"alert"`，`event` 为 `mcp_unavailable` 或 `mcp_tools_missing`），退出码 2。
 - 下面几种情况由程序直接回固定文案「查不到：<原因>。」，不再把结果交给模型：工具报错（`isError`）、API 拒绝（401/403）、连不上 MCP、工具超时（30 秒）、模型要调清单外的工具或参数不是 JSON 对象、超过工具调用上限。
 - 模型没调任何工具就直接回答：判为失败，回「查不到」，不显示模型的回答（Ollama 不支持 `tool_choice`，没法强制调工具）。
 - 推理模型的「思考」内容（`<think>…</think>` 段，或单独的 `reasoning` / `reasoning_content` 字段）不显示、不写进调用记录，也不回传给模型。
