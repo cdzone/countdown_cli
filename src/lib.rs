@@ -213,12 +213,8 @@ pub fn next_occurrence(
         Some(RepeatMode::Weekday) => {
             let today = now.date().and_time(clock);
             match now.weekday() {
-                Weekday::Sat => {
-                    Some((now.date() + chrono::Duration::days(2)).and_time(clock))
-                }
-                Weekday::Sun => {
-                    Some((now.date() + chrono::Duration::days(1)).and_time(clock))
-                }
+                Weekday::Sat => Some((now.date() + chrono::Duration::days(2)).and_time(clock)),
+                Weekday::Sun => Some((now.date() + chrono::Duration::days(1)).and_time(clock)),
                 _ => {
                     // Mon–Fri
                     if now < today {
