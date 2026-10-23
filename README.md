@@ -124,7 +124,7 @@ MCP 入口的 `Origin` 校验：请求不带 `Origin` 放行；带了但不是 `
 
 | 工具 | 用途 |
 |---|---|
-| `get_next_countdown` | 无参。服务端挑 `remaining_seconds >= 0` 且最小的一条；没有则返回 `{"countdown":null}`，不拿过期的充数。问「最近／下一个」用它。 |
+| `get_next_countdown` | 无参。服务端挑 `next_remaining_seconds >= 0` 且最小的一条；没有则返回 `{"countdown":null}`，不拿过期的充数。问「最近／下一个」用它。 |
 | `list_countdowns` | 默认仍返回全部（可用 `within_hours` / `include_disabled` 过滤）；每条带服务端算的 `expired`。问「有哪些／哪些过期了」用它；**不要**用它来猜最近。 |
 | `get_countdown` | 按 id 取一条。 |
 
@@ -268,7 +268,7 @@ MCP_STORAGE_DIR=$(mktemp -d) npx @modelcontextprotocol/inspector@2.12.0 --cli \
 - 不做令牌热加载、限流、日志外送和服务内轮转；没有终端用户级别的权限，只认到「哪个程序在调」。
 - API 和 MCP 同写一个审计文件没有测过，不要这样配。
 - MCP 审计目前只记工具调用、启动探测异常和入口拒绝；规格要求的协议层请求（initialize、tools/list 等）的 `rpc:<方法>` 行本版还没有实现。
-- 每日重复的倒计时在当天目标时刻过后，API 给出的 `remaining_seconds` 仍为负数（目标时刻尚未滚到下一天）。`get_next_countdown` 会跳过它（不当「下一个」）；`list_countdowns` 仍返回它并标 `expired: true`，问「有哪些」不会少报。
+- `remaining_seconds` / `target_time` 对 Daily/Weekday 是**本周期 elapsed 显示**（过点后为负，终端可显示「已过去多久」；Weekday 同）。Agent「下一个／过期／N 小时内」应看 API 追加的 `next_target_time` / `next_remaining_seconds`（`next_occurrence`）。MCP 的 `get_next_countdown`、`expired`、`within_hours` 已改吃 `next_*`；旧字段语义不变。
 
 ## 11. 命令行智能体 `countdown_agent`
 
@@ -338,7 +338,7 @@ countdown_agent                          # 不带参数：一行一个问题，C
 
 ### 11.4 已知限制
 
-- 第 5 步只用假网关测过；**真实 Ollama 联调未验收**，模型调工具准不准、思考输出对工具调用的影响都没有实测。
+- 第 5 步自动测只用假网关；**CLI 默认示例模型（`deepseek-r1:8b`）的真实 Ollama 联调未作为发布门槛**。0.7.1 **网页**路径曾用 `gemma4:31b` 人工确认会调 `get_next_countdown`——那是网页验收，不是 CLI 默认模型的完整联调证据。
 - 智能体只回答倒计时问题：每个问题都要求模型至少调一次工具，所以打招呼、闲聊也会得到「查不到」。
 - 多轮对话只保留之前的问题和最终回答，不保留工具结果；追问时模型要重新查。
 - 不流式输出，回答要等模型整段生成完；推理模型会比较慢。
@@ -411,6 +411,6 @@ CI 里 `npm audit` 遇到高危及以上即失败。这是已接受的约定：�
 
 ### 12.6 已知限制
 
-- 真实 Ollama 和浏览器手工联调未验收（规格验收第 4 条的截图需人工补）；自动测试用假网关加真实 MCP、API。
+- CLI 默认模型的真实 Ollama 联调未当发布门槛；网页侧曾用 `gemma4:31b` 做过工具调用人工确认（与 CLI 默认模型分开记）。自动测试用假网关加真实 MCP、API。
 - 回答不逐字出现，要等模型整段生成完。
 - 页面不保存历史，刷新即清空。
