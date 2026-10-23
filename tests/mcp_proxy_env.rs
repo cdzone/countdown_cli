@@ -14,7 +14,8 @@ async fn list_works_with_proxy_env_set() {
             Json(json!([{
                 "id": "a", "title": "a", "datetime": "2026-12-31 18:00:00",
                 "enabled": true, "repeat": null,
-                "target_time": "2026-12-31 18:00:00", "remaining_seconds": 100
+                "target_time": "2026-12-31 18:00:00", "remaining_seconds": 100,
+                "next_target_time": "2026-12-31 18:00:00", "next_remaining_seconds": 100
             }]))
         }),
     );

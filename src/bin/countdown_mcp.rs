@@ -410,18 +410,34 @@ fn rejected_credential(status: reqwest::StatusCode) -> String {
     )
 }
 
+/// Require the field to be present in JSON; value may be null → `Ok(None)`.
+/// Missing field → deserialize error (fail-closed for old API without `next_*`).
+fn require_option<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
 /// Fields of the API's countdown object that the tools expose, plus a
 /// server-computed `expired` flag (the API does not send it).
+///
+/// `next_*` must appear in the API JSON (value may be null). `remaining_seconds`
+/// is accepted from the API for diagnostics but **not** serialized back to the
+/// model — Agents must use `next_*` for "how long until / next occurrence".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct Countdown {
     id: String,
     title: String,
     target_time: Option<String>,
+    /// Elapsed/display field from API; skipped on the way out to the model.
+    #[serde(default, skip_serializing)]
     remaining_seconds: Option<i64>,
     /// Next occurrence (from API `next_*`); used for Agent pick/expired/window.
-    #[serde(default)]
+    #[serde(deserialize_with = "require_option")]
     next_target_time: Option<String>,
-    #[serde(default)]
+    #[serde(deserialize_with = "require_option")]
     next_remaining_seconds: Option<i64>,
     repeat: Option<String>,
     enabled: bool,
@@ -450,10 +466,10 @@ fn is_upcoming(c: &Countdown) -> bool {
 /// Recurring items use API `next_*` (rolled forward), so a Daily/Weekday that
 /// already passed today's clock is still upcoming until it has no next fire.
 fn pick_next(items: impl IntoIterator<Item = Countdown>) -> Option<Countdown> {
-    items
-        .into_iter()
-        .filter(is_upcoming)
-        .min_by_key(|c| c.next_remaining_seconds.expect("is_upcoming guarantees Some"))
+    items.into_iter().filter(is_upcoming).min_by_key(|c| {
+        c.next_remaining_seconds
+            .expect("is_upcoming guarantees Some")
+    })
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -491,6 +507,15 @@ fn json_result<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
 fn due_within(c: &Countdown, hours: u32) -> bool {
     let limit = i64::from(hours) * 3600;
     matches!(c.next_remaining_seconds, Some(s) if (0..=limit).contains(&s))
+}
+
+/// Sort for the model: upcoming by `next_remaining_seconds` asc, then expired, then unknown.
+fn sort_for_model(items: &mut [Countdown]) {
+    items.sort_by_key(|c| match c.next_remaining_seconds {
+        Some(s) if s >= 0 => (0u8, s),
+        Some(s) => (1u8, s),
+        None => (2u8, 0),
+    });
 }
 
 /// Result of the startup probe that `main` has to act on.
@@ -618,7 +643,7 @@ impl CountdownMcp {
     }
 
     #[tool(
-        description = "List countdowns sorted by target time. Each item includes a server-computed expired flag (next_remaining_seconds < 0). Use when the user asks what exists, which have expired, or wants to browse. Do not use this to answer which is nearest/next — call get_next_countdown instead. Returns id, title, target_time, remaining_seconds, next_target_time, next_remaining_seconds, repeat, enabled, expired."
+        description = "List countdowns sorted by next_remaining_seconds (upcoming first). Each item includes a server-computed expired flag (next_remaining_seconds < 0). Use when the user asks what exists, which have expired, or wants to browse. Do not use this to answer which is nearest/next — call get_next_countdown instead. For how long until / next fire, use next_target_time and next_remaining_seconds only (not target_time alone). Returns id, title, target_time, next_target_time, next_remaining_seconds, repeat, enabled, expired."
     )]
     async fn list_countdowns(
         &self,
@@ -638,7 +663,7 @@ impl CountdownMcp {
             .fetch::<Vec<Countdown>>(url, &up)
             .await
             .and_then(|items| {
-                let items: Vec<Countdown> = match args.within_hours {
+                let mut items: Vec<Countdown> = match args.within_hours {
                     Some(h) => items
                         .into_iter()
                         .filter(|c| due_within(c, h))
@@ -646,6 +671,7 @@ impl CountdownMcp {
                         .collect(),
                     None => items.into_iter().map(annotate).collect(),
                 };
+                sort_for_model(&mut items);
                 json_result(&items).map_err(|e| Failure {
                     outcome: Outcome::Error,
                     upstream_status: None,
@@ -656,7 +682,7 @@ impl CountdownMcp {
     }
 
     #[tool(
-        description = "Get one countdown by id. Returns id, title, target_time, remaining_seconds, next_target_time, next_remaining_seconds, repeat, enabled, and a server-computed expired flag (based on next_remaining_seconds). Use when the id is already known."
+        description = "Get one countdown by id. Returns id, title, target_time, next_target_time, next_remaining_seconds, repeat, enabled, and a server-computed expired flag (based on next_remaining_seconds). For how long until / next fire, use next_* only. Use when the id is already known."
     )]
     async fn get_countdown(
         &self,
@@ -683,7 +709,7 @@ impl CountdownMcp {
     }
 
     #[tool(
-        description = "Return the single nearest countdown that has not expired yet (next_remaining_seconds >= 0), chosen by the server. Use when the user asks which is next, nearest, or soon due. Do not use list_countdowns for that. If none are upcoming, returns {\"countdown\":null} — do not pick an expired one."
+        description = "Return the single nearest countdown that has not expired yet (next_remaining_seconds >= 0), chosen by the server. Use when the user asks which is next, nearest, soon due, or how long until the next one — read next_target_time / next_remaining_seconds on the result. Do not use list_countdowns for that. If none are upcoming, returns {\"countdown\":null} — do not pick an expired one."
     )]
     async fn get_next_countdown(
         &self,
@@ -714,12 +740,16 @@ impl CountdownMcp {
     }
 }
 
-const MCP_INSTRUCTIONS: &str = "Read-only countdown tools. Ask which is next/nearest/soon due → get_next_countdown (server picks one; empty means none upcoming). Ask what exists / which expired / browse → list_countdowns (default returns all; each item has expired). Known id → get_countdown. Do not use list_countdowns to guess the nearest item.";
+const MCP_INSTRUCTIONS: &str = "Read-only countdown tools. Ask which is next/nearest/soon due / how long until → get_next_countdown (server picks one; empty means none upcoming; use next_target_time and next_remaining_seconds only). Ask what exists / which expired / browse → list_countdowns (default returns all; each item has expired; remaining time fields are next_*). Known id → get_countdown. Do not use list_countdowns to guess the nearest item.";
 
 #[tool_handler]
 impl ServerHandler for CountdownMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                "countdown_cli",
+                env!("CARGO_PKG_VERSION"),
+            ))
             .with_instructions(MCP_INSTRUCTIONS)
     }
 }
@@ -943,8 +973,11 @@ mod tests {
 
         let r = mcp.get_countdown(get_args("edge"), anon()).await.unwrap();
         assert_eq!(r.is_error, Some(false));
-        let c: Countdown = serde_json::from_str(&text(&r)).unwrap();
-        assert_eq!(c.remaining_seconds, Some(3600));
+        let raw: Value = serde_json::from_str(&text(&r)).unwrap();
+        assert!(raw.get("remaining_seconds").is_none(), "{raw}");
+        let c: Countdown = serde_json::from_value(raw).unwrap();
+        assert_eq!(c.next_remaining_seconds, Some(3600));
+        assert!(!c.expired);
     }
 
     #[tokio::test]
@@ -991,15 +1024,22 @@ mod tests {
         let by_id: std::collections::HashMap<_, _> =
             items.into_iter().map(|c| (c.id.clone(), c)).collect();
         assert!(by_id["past"].expired);
-        assert_eq!(by_id["past"].remaining_seconds, Some(-1));
+        assert_eq!(by_id["past"].next_remaining_seconds, Some(-1));
         assert!(!by_id["now"].expired);
         assert!(!by_id["edge"].expired);
         assert!(!by_id["later"].expired);
-        // remaining_seconds is None → not marked expired (honest).
+        // next_remaining_seconds is None → not marked expired (honest).
         assert!(!by_id["none"].expired);
-        assert_eq!(by_id["none"].remaining_seconds, None);
+        assert_eq!(by_id["none"].next_remaining_seconds, None);
         // Past oneshot stand-in: still present and expired (next_* negative).
         assert!(ids(&r).contains(&"past".to_string()));
+        // Model view must not include remaining_seconds.
+        let raw: Value = serde_json::from_str(&text(&r)).unwrap();
+        assert!(raw
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|v| v.get("remaining_seconds").is_none()));
     }
 
     #[tokio::test]
@@ -1010,8 +1050,10 @@ mod tests {
         let next: NextCountdown = serde_json::from_str(&text(&r)).unwrap();
         let c = next.countdown.expect("mixed fixture has upcoming");
         assert_eq!(c.id, "now");
-        assert_eq!(c.remaining_seconds, Some(0));
+        assert_eq!(c.next_remaining_seconds, Some(0));
         assert!(!c.expired);
+        let raw: Value = serde_json::from_str(&text(&r)).unwrap();
+        assert!(raw["countdown"].get("remaining_seconds").is_none(), "{raw}");
     }
 
     #[tokio::test]
@@ -1020,7 +1062,8 @@ mod tests {
             item("past", Some(-10), true),
             item("older", Some(-1), true),
             // One-shot stand-ins with negative next_*: still listable, not "next".
-            item("daily", Some(-30), true),
+            // (id must not imply daily — recurring next_* is never negative.)
+            item("past_oneshot_extra", Some(-30), true),
         ];
         let list_handler = {
             let all = all.clone();
@@ -1048,7 +1091,7 @@ mod tests {
         let items: Vec<Countdown> = serde_json::from_str(&text(&r)).unwrap();
         assert_eq!(items.len(), 3);
         assert!(items.iter().all(|c| c.expired));
-        assert!(items.iter().any(|c| c.id == "daily"));
+        assert!(items.iter().any(|c| c.id == "past_oneshot_extra"));
     }
 
     #[tokio::test]
@@ -1069,7 +1112,8 @@ mod tests {
                 remaining_seconds: Some(-5),
                 next_target_time: Some("t".into()),
                 next_remaining_seconds: Some(-5),
-                repeat: Some("daily".into()),
+                // Oneshot: recurring next_* would not stay negative.
+                repeat: None,
                 enabled: true,
                 expired: false,
             }),
@@ -1117,8 +1161,20 @@ mod tests {
         // After today's Daily/Weekday point: remaining negative, next_* positive.
         // Far oneshot still positive on both; pick_next must choose the nearer next_*.
         let all = vec![
-            item_next("daily", Some(-3 * 3600), Some(21 * 3600), Some("daily"), true),
-            item_next("weekday", Some(-3 * 3600), Some(21 * 3600 + 60), Some("weekday"), true),
+            item_next(
+                "daily",
+                Some(-3 * 3600),
+                Some(21 * 3600),
+                Some("daily"),
+                true,
+            ),
+            item_next(
+                "weekday",
+                Some(-3 * 3600),
+                Some(21 * 3600 + 60),
+                Some("weekday"),
+                true,
+            ),
             item_next("oneshot", Some(7 * 86400), Some(7 * 86400), None, true),
         ];
         let list_handler = {
@@ -1142,14 +1198,20 @@ mod tests {
         assert_eq!(c.id, "daily");
         assert_eq!(c.next_remaining_seconds, Some(21 * 3600));
         assert!(!c.expired);
-        // Elapsed field still negative (terminal display semantics).
-        assert_eq!(c.remaining_seconds, Some(-3 * 3600));
+        // Model view omits remaining_seconds; next_* is the answer for "how long".
+        let raw_next: Value = serde_json::from_str(&text(&r)).unwrap();
+        assert!(raw_next["countdown"].get("remaining_seconds").is_none());
 
         let r = mcp
             .list_countdowns(list(None, false), anon())
             .await
             .unwrap();
         let items: Vec<Countdown> = serde_json::from_str(&text(&r)).unwrap();
+        // Upcoming-first sort: daily (21h) before weekday (21h+60) before oneshot (7d).
+        assert_eq!(
+            items.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["daily", "weekday", "oneshot"]
+        );
         let by_id: std::collections::HashMap<_, _> =
             items.into_iter().map(|c| (c.id.clone(), c)).collect();
         // Recurring after point: not expired for Agent (next still ahead).
@@ -1182,6 +1244,117 @@ mod tests {
         assert_eq!(r.is_error, Some(false));
         let next: NextCountdown = serde_json::from_str(&text(&r)).unwrap();
         assert!(next.countdown.is_none(), "{}", text(&r));
+    }
+
+    #[test]
+    fn countdown_rejects_missing_next_fields() {
+        let v = json!({
+            "id": "a", "title": "a",
+            "target_time": "2026-10-22 12:00:00",
+            "remaining_seconds": 100,
+            "repeat": null,
+            "enabled": true
+        });
+        let err = serde_json::from_value::<Countdown>(v).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("next_target_time") || msg.contains("next_remaining_seconds"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn countdown_accepts_explicit_null_next_as_not_upcoming() {
+        let v = json!({
+            "id": "a", "title": "a",
+            "target_time": null,
+            "remaining_seconds": null,
+            "next_target_time": null,
+            "next_remaining_seconds": null,
+            "repeat": null,
+            "enabled": true
+        });
+        let c: Countdown = serde_json::from_value(v).unwrap();
+        assert_eq!(c.next_remaining_seconds, None);
+        assert_eq!(c.next_target_time, None);
+        assert!(!is_upcoming(&c));
+        assert!(pick_next(std::iter::once(annotate(c))).is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_next_fields_from_api_is_tool_error_not_false_empty() {
+        // Old API shape (pre-next_*): must fail closed, not succeed with null/empty.
+        let body = json!([{
+            "id": "morning", "title": "晨会", "datetime": "2026-10-22 09:00:00",
+            "enabled": true, "repeat": "daily",
+            "target_time": "2026-10-22 09:00:00",
+            "remaining_seconds": -3600
+        }]);
+        let app = Router::new().route(
+            "/countdowns",
+            get(move || {
+                let body = body.clone();
+                async move { Json(body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url: reqwest::Url = format!("http://{addr}").parse().unwrap();
+        let mcp = mcp(url);
+
+        let r = mcp.get_next_countdown(anon()).await.unwrap();
+        assert_eq!(
+            r.is_error,
+            Some(true),
+            "must not succeed with false empty: {}",
+            text(&r)
+        );
+        assert!(text(&r).contains("unexpected body"), "{}", text(&r));
+        // Must not look like honest empty.
+        assert!(!text(&r).contains("\"countdown\":null"), "{}", text(&r));
+
+        let r = mcp
+            .list_countdowns(list(None, false), anon())
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true), "{}", text(&r));
+    }
+
+    #[tokio::test]
+    async fn explicit_null_next_fields_yield_honest_empty_next() {
+        let body = json!([{
+            "id": "unknown", "title": "unknown", "datetime": "2026-10-22 09:00:00",
+            "enabled": true, "repeat": null,
+            "target_time": null,
+            "remaining_seconds": null,
+            "next_target_time": null,
+            "next_remaining_seconds": null
+        }]);
+        let app = Router::new().route(
+            "/countdowns",
+            get(move || {
+                let body = body.clone();
+                async move { Json(body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url: reqwest::Url = format!("http://{addr}").parse().unwrap();
+        let mcp = mcp(url);
+
+        let r = mcp.get_next_countdown(anon()).await.unwrap();
+        assert_eq!(r.is_error, Some(false), "{}", text(&r));
+        let next: NextCountdown = serde_json::from_str(&text(&r)).unwrap();
+        assert!(next.countdown.is_none(), "{}", text(&r));
+    }
+
+    #[test]
+    fn server_info_reports_app_name_and_crate_version() {
+        let info = mcp("http://127.0.0.1:9".parse().unwrap()).get_info();
+        assert_eq!(info.server_info.name, "countdown_cli");
+        assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
