@@ -308,6 +308,7 @@ async fn call_tool(
 }
 
 /// Text of a successful result, or the reason category of a failed one.
+/// Branches on `structuredContent.error.code` only — never on message text.
 fn tool_outcome(result: &CallToolResult) -> Result<String, &'static str> {
     let text: String = result
         .content
@@ -317,14 +318,18 @@ fn tool_outcome(result: &CallToolResult) -> Result<String, &'static str> {
     if result.is_error != Some(true) {
         return Ok(text);
     }
-    Err(if text.contains("rejected the MCP service credential") {
-        "数据接口拒绝了访问（401/403）"
-    } else if text.contains("not found") {
-        "没有这个倒计时"
-    } else if text.contains("unreachable") {
-        "数据接口连不上"
-    } else {
-        "工具返回错误"
+    let code = result
+        .structured_content
+        .as_ref()
+        .and_then(|v| v.get("error"))
+        .and_then(|e| e.get("code"))
+        .and_then(|c| c.as_str());
+    Err(match code {
+        Some("not_found") => "没有这个倒计时",
+        Some("unauthenticated") | Some("permission_denied") => "数据接口拒绝了访问（401/403）",
+        Some("upstream_unavailable") => "数据接口连不上",
+        Some("contract_mismatch") => "数据接口契约不匹配",
+        _ => "工具返回错误",
     })
 }
 

@@ -195,7 +195,7 @@ impl AuthFail {
         };
         let challenge = bearer_challenge(invalid_token, Some(Scope::CountdownsRead));
         with_challenge(
-            api_error("unauthorized", message, StatusCode::UNAUTHORIZED),
+            api_error("unauthenticated", message, StatusCode::UNAUTHORIZED),
             challenge,
         )
     }
@@ -229,7 +229,11 @@ fn forbidden(scope: Option<Scope>) -> Response {
         None => "Bearer error=\"insufficient_scope\"".to_string(),
     };
     with_challenge(
-        api_error("forbidden", "insufficient scope", StatusCode::FORBIDDEN),
+        api_error(
+            "permission_denied",
+            "insufficient scope",
+            StatusCode::FORBIDDEN,
+        ),
         challenge,
     )
 }
@@ -1103,7 +1107,7 @@ datetime = "2026-12-31 00:00:00"
                 r.challenge(),
                 r#"Bearer realm="countdown", scope="countdowns:read""#
             );
-            assert_eq!(r.code(), "unauthorized");
+            assert_eq!(r.code(), "unauthenticated");
         }
         let lines = audit_lines(&path);
         assert_eq!(lines.len(), 5);
@@ -1124,7 +1128,7 @@ datetime = "2026-12-31 00:00:00"
         for uri in ["/countdowns", "/nope"] {
             let r = send(&router, "GET", uri, &[("authorization", &auth)], "").await;
             assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{uri}");
-            assert_eq!(r.code(), "unauthorized");
+            assert_eq!(r.code(), "unauthenticated");
             assert!(r.challenge().contains(r#"error="invalid_token""#));
             assert!(!r.body.contains(token));
         }
@@ -1185,7 +1189,7 @@ datetime = "2026-12-31 00:00:00"
         for (method, uri, body) in cases {
             let r = send(&router, method, uri, &[("authorization", READ_AUTH)], body).await;
             assert_eq!(r.status, StatusCode::FORBIDDEN, "{method} {body}");
-            assert_eq!(r.code(), "forbidden");
+            assert_eq!(r.code(), "permission_denied");
             assert_eq!(
                 r.challenge(),
                 r#"Bearer error="insufficient_scope", scope="countdowns:write""#
@@ -1225,7 +1229,7 @@ datetime = "2026-12-31 00:00:00"
             )
             .await;
             assert_eq!(r.status, StatusCode::FORBIDDEN, "{method} {uri}");
-            assert_eq!(r.code(), "forbidden");
+            assert_eq!(r.code(), "permission_denied");
             assert_eq!(r.challenge(), r#"Bearer error="insufficient_scope""#);
         }
         assert_eq!(fs::read(&path).unwrap(), before);
