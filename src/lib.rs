@@ -6,6 +6,7 @@ use tokio::sync::Mutex;
 
 pub mod audit;
 pub mod auth;
+pub mod error;
 
 /// Repeat mode for recurring countdowns
 #[derive(Debug, Clone, PartialEq)]

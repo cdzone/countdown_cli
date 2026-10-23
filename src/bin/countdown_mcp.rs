@@ -23,6 +23,7 @@ use clap::Parser;
 use countdown_cli::{
     audit::{truncated, AuditLog},
     auth::{bearer_challenge, read_token_file, TokenFileError, TokenTable},
+    error::ErrorCode,
 };
 use rmcp::{
     handler::server::{tool::Extension, wrapper::Parameters},
@@ -168,6 +169,7 @@ fn write_audit(audit: &AuditLog, record: &Record<'_>) {
 struct Failure {
     outcome: Outcome,
     upstream_status: Option<reqwest::StatusCode>,
+    code: ErrorCode,
     message: String,
 }
 
@@ -243,7 +245,7 @@ impl Upstream {
             }
             Err(f) => {
                 self.record(audit, f.outcome, Some(true), f.upstream_status);
-                tool_error(f.message)
+                tool_error(f.code, f.message)
             }
         };
         let mut meta = serde_json::Map::new();
@@ -494,8 +496,28 @@ struct CountdownMcp {
     audit: AuditLog,
 }
 
-fn tool_error(msg: String) -> CallToolResult {
-    CallToolResult::error(vec![ContentBlock::text(msg)])
+fn tool_error(code: ErrorCode, message: String) -> CallToolResult {
+    // `CallToolResult` is non-exhaustive; start from `error` then attach the
+    // application envelope. `content` stays the human sentence; code lives in
+    // `structuredContent.error` (not the whole JSON dumped into content).
+    let mut result = CallToolResult::error(vec![ContentBlock::text(message.clone())]);
+    result.structured_content = Some(serde_json::json!({
+        "error": {
+            "code": code.as_str(),
+            "message": message,
+        }
+    }));
+    result
+}
+
+/// Application error code from a tool result (unit tests).
+#[cfg(test)]
+fn error_code_of(r: &CallToolResult) -> Option<&str> {
+    r.structured_content
+        .as_ref()
+        .and_then(|v| v.get("error"))
+        .and_then(|e| e.get("code"))
+        .and_then(|c| c.as_str())
 }
 
 fn json_result<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
@@ -568,15 +590,17 @@ impl CountdownMcp {
         url: reqwest::Url,
         up: &Upstream,
     ) -> Result<T, Failure> {
-        let fail = |outcome, upstream_status, message| Failure {
+        let fail = |outcome, upstream_status, code, message| Failure {
             outcome,
             upstream_status,
+            code,
             message,
         };
         let resp = self.get(url.clone(), up).send().await.map_err(|e| {
             fail(
                 Outcome::UpstreamUnreachable,
                 None,
+                ErrorCode::UpstreamUnavailable,
                 format!("countdown API unreachable at {url}: {e}"),
             )
         })?;
@@ -585,25 +609,48 @@ impl CountdownMcp {
             return Err(fail(
                 Outcome::NotFound,
                 Some(status),
+                ErrorCode::NotFound,
                 "countdown not found".to_string(),
             ));
         }
         // The API's body is not passed on: it is not meant for the model.
-        if matches!(
-            status,
-            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
-        ) {
+        if status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(fail(
                 Outcome::UpstreamAuthFailed,
                 Some(status),
+                ErrorCode::Unauthenticated,
+                rejected_credential(status),
+            ));
+        }
+        if status == reqwest::StatusCode::FORBIDDEN {
+            return Err(fail(
+                Outcome::UpstreamAuthFailed,
+                Some(status),
+                ErrorCode::PermissionDenied,
                 rejected_credential(status),
             ));
         }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            // Prefer a known application code from the body on 4xx; 5xx stays
+            // `internal` so a mislabeled upstream body cannot mask server faults.
+            let code = if status.is_server_error() {
+                ErrorCode::Internal
+            } else {
+                serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("error")
+                            .and_then(|e| e.get("code"))
+                            .and_then(|c| c.as_str())
+                            .and_then(ErrorCode::parse)
+                    })
+                    .unwrap_or(ErrorCode::Internal)
+            };
             return Err(fail(
                 Outcome::Error,
                 Some(status),
+                code,
                 format!("countdown API returned {status}: {body}"),
             ));
         }
@@ -611,6 +658,7 @@ impl CountdownMcp {
             fail(
                 Outcome::Error,
                 Some(status),
+                ErrorCode::ContractMismatch,
                 format!("countdown API returned an unexpected body: {e}"),
             )
         })
@@ -675,6 +723,7 @@ impl CountdownMcp {
                 json_result(&items).map_err(|e| Failure {
                     outcome: Outcome::Error,
                     upstream_status: None,
+                    code: ErrorCode::Internal,
                     message: e.message.to_string(),
                 })
             });
@@ -698,6 +747,7 @@ impl CountdownMcp {
             Ok(item) => json_result(&annotate(item)).map_err(|e| Failure {
                 outcome: Outcome::Error,
                 upstream_status: None,
+                code: ErrorCode::Internal,
                 message: e.message.to_string(),
             }),
             Err(mut f) => {
@@ -733,6 +783,7 @@ impl CountdownMcp {
                 json_result(&next).map_err(|e| Failure {
                     outcome: Outcome::Error,
                     upstream_status: None,
+                    code: ErrorCode::Internal,
                     message: e.message.to_string(),
                 })
             });
@@ -958,10 +1009,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.is_error, Some(true));
-        assert!(text(&r).contains("unreachable"), "{}", text(&r));
+        assert_eq!(error_code_of(&r), Some("upstream_unavailable"));
         let r = mcp.get_countdown(get_args("x"), anon()).await.unwrap();
         assert_eq!(r.is_error, Some(true));
-        assert!(text(&r).contains("unreachable"), "{}", text(&r));
+        assert_eq!(error_code_of(&r), Some("upstream_unavailable"));
     }
 
     #[tokio::test]
@@ -969,7 +1020,7 @@ mod tests {
         let mcp = mcp(stub_api().await);
         let r = mcp.get_countdown(get_args("nope"), anon()).await.unwrap();
         assert_eq!(r.is_error, Some(true));
-        assert!(text(&r).contains("not found"), "{}", text(&r));
+        assert_eq!(error_code_of(&r), Some("not_found"));
 
         let r = mcp.get_countdown(get_args("edge"), anon()).await.unwrap();
         assert_eq!(r.is_error, Some(false));
@@ -988,7 +1039,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.is_error, Some(true));
-        assert!(text(&r).contains("not found"), "{}", text(&r));
+        assert_eq!(error_code_of(&r), Some("not_found"));
     }
 
     #[tokio::test]
@@ -1099,7 +1150,7 @@ mod tests {
         let mcp = mcp(unreachable_url().await);
         let r = mcp.get_next_countdown(anon()).await.unwrap();
         assert_eq!(r.is_error, Some(true));
-        assert!(text(&r).contains("unreachable"), "{}", text(&r));
+        assert_eq!(error_code_of(&r), Some("upstream_unavailable"));
     }
 
     #[test]
@@ -1310,7 +1361,7 @@ mod tests {
             "must not succeed with false empty: {}",
             text(&r)
         );
-        assert!(text(&r).contains("unexpected body"), "{}", text(&r));
+        assert_eq!(error_code_of(&r), Some("contract_mismatch"));
         // Must not look like honest empty.
         assert!(!text(&r).contains("\"countdown\":null"), "{}", text(&r));
 
@@ -1319,6 +1370,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.is_error, Some(true), "{}", text(&r));
+        assert_eq!(error_code_of(&r), Some("contract_mismatch"));
     }
 
     #[tokio::test]
@@ -1430,24 +1482,27 @@ mod tests {
 
     #[tokio::test]
     async fn rejected_credential_is_fixed_text_without_api_body() {
-        for (status, code) in [
-            (StatusCode::UNAUTHORIZED, 401),
-            (StatusCode::FORBIDDEN, 403),
+        for (status, http, app_code) in [
+            (StatusCode::UNAUTHORIZED, 401, "unauthenticated"),
+            (StatusCode::FORBIDDEN, 403, "permission_denied"),
         ] {
             let (url, _) = recording_api(status, SECRET_BODY).await;
             let mcp = mcp(url);
             let expected =
-                format!("countdown API rejected the MCP service credential (HTTP {code})");
+                format!("countdown API rejected the MCP service credential (HTTP {http})");
 
             let r = mcp
                 .list_countdowns(list(None, false), anon())
                 .await
                 .unwrap();
             assert_eq!(r.is_error, Some(true));
+            assert_eq!(error_code_of(&r), Some(app_code));
             assert_eq!(text(&r), expected);
+            assert!(!text(&r).contains("BODY-MARKER"), "{}", text(&r));
 
             let r = mcp.get_countdown(get_args("a"), anon()).await.unwrap();
             assert_eq!(r.is_error, Some(true));
+            assert_eq!(error_code_of(&r), Some(app_code));
             assert!(text(&r).starts_with(&expected), "{}", text(&r));
             assert!(!text(&r).contains("BODY-MARKER"), "{}", text(&r));
         }
@@ -1461,6 +1516,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.is_error, Some(true));
+        assert_eq!(error_code_of(&r), Some("internal"));
+        // Message may still carry the upstream body for operators; code is what
+        // clients branch on.
         assert!(text(&r).contains("BODY-MARKER"), "{}", text(&r));
     }
 
