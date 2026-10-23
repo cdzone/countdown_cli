@@ -17,7 +17,7 @@ use countdown_cli::{
 };
 use serde_json::{json, Value};
 
-use countdown_cli::{calculate_target_time, Countdown, CountdownStore, RepeatMode};
+use countdown_cli::{calculate_target_time, next_occurrence, Countdown, CountdownStore, RepeatMode};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ApiCountdown {
@@ -26,8 +26,14 @@ pub struct ApiCountdown {
     pub datetime: String,
     pub enabled: bool,
     pub repeat: Option<String>, // unified to "weekday" if present
+    /// Current-period target (elapsed display). Unchanged semantics.
     pub target_time: Option<String>,
+    /// Seconds until/since [`Self::target_time`] (negative after the period's point).
     pub remaining_seconds: Option<i64>,
+    /// Next occurrence target for Agent "which is next" (from [`next_occurrence`]).
+    pub next_target_time: Option<String>,
+    /// Seconds until [`Self::next_target_time`] (≥ 0 for recurring modes that still fire).
+    pub next_remaining_seconds: Option<i64>,
 }
 
 impl ApiCountdown {
@@ -35,6 +41,8 @@ impl ApiCountdown {
         let id = countdown.id.as_ref()?.clone();
         let target = calculate_target_time(&countdown.datetime, countdown.repeat.as_ref(), now);
         let remaining_seconds = target.map(|t| (t - now).num_seconds());
+        let next = next_occurrence(&countdown.datetime, countdown.repeat.as_ref(), now);
+        let next_remaining_seconds = next.map(|t| (t - now).num_seconds());
         Some(Self {
             id,
             title: countdown.title.clone(),
@@ -46,6 +54,8 @@ impl ApiCountdown {
             }),
             target_time: target.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
             remaining_seconds,
+            next_target_time: next.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
+            next_remaining_seconds,
         })
     }
 }
@@ -487,6 +497,8 @@ async fn create_countdown(
                     .map(|s| s.to_string()),
                 target_time: None,
                 remaining_seconds: None,
+                next_target_time: None,
+                next_remaining_seconds: None,
             });
             (StatusCode::CREATED, Json(api)).into_response()
         }
@@ -547,6 +559,41 @@ mod tests {
     const READ_TOKEN: &str = "read-token-0123456789abcdef0123456789abcdef0";
     const WRITE_AUTH: &str = "Bearer write-token-0123456789abcdef0123456789abcdef";
     const READ_AUTH: &str = "Bearer read-token-0123456789abcdef0123456789abcdef0";
+
+    #[test]
+    fn from_domain_daily_after_target_keeps_elapsed_and_adds_next() {
+        let now = NaiveDateTime::parse_from_str("2025-01-15 19:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+        let c = Countdown {
+            id: Some("daily".into()),
+            title: "standup".into(),
+            datetime: "2024-08-30 18:00:00".into(),
+            enabled: true,
+            repeat: Some(RepeatMode::Daily),
+        };
+        let api = ApiCountdown::from_domain(&c, now).unwrap();
+        assert_eq!(api.target_time.as_deref(), Some("2025-01-15 18:00:00"));
+        assert_eq!(api.remaining_seconds, Some(-3600));
+        assert_eq!(api.next_target_time.as_deref(), Some("2025-01-16 18:00:00"));
+        assert_eq!(api.next_remaining_seconds, Some(23 * 3600));
+    }
+
+    #[test]
+    fn from_domain_weekday_weekend_next_is_monday() {
+        let now = NaiveDateTime::parse_from_str("2025-01-18 10:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+        let c = Countdown {
+            id: Some("wd".into()),
+            title: "standup".into(),
+            datetime: "2024-08-30 18:00:00".into(),
+            enabled: true,
+            repeat: Some(RepeatMode::Weekday),
+        };
+        let api = ApiCountdown::from_domain(&c, now).unwrap();
+        // Elapsed display still Friday; next occurrence Monday.
+        assert_eq!(api.target_time.as_deref(), Some("2025-01-17 18:00:00"));
+        assert!(api.remaining_seconds.unwrap() < 0);
+        assert_eq!(api.next_target_time.as_deref(), Some("2025-01-20 18:00:00"));
+        assert!(api.next_remaining_seconds.unwrap() > 0);
+    }
 
     fn sha256_hex(s: &str) -> String {
         use sha2::Digest as _;

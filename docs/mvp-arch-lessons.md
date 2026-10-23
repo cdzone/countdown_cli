@@ -11,7 +11,7 @@
 
 这是一次「传统业务系统 + 只读 MCP + 本机模型 Agent + 可选网页」的最小闭环。业务真相在 `countdown_cli --api`；模型只经 MCP 调三个只读工具；「最近/下一个」这类易错意图用**专用工具 + 服务端挑条目**钉死，而不是让模型从全量列表里猜。
 
-对后续真实传统业务：先拆出稳定 HTTP 契约与意图级工具，再挂 Agent；能用代码定的规则不要只写在提示词里。0.7.1 网页验收已用 `gemma4:31b` 确认调 `get_next_countdown`、答「未到期样例条目」。
+对后续真实传统业务：先拆出稳定 HTTP 契约与意图级工具，再挂 Agent；能用代码定的规则不要只写在提示词里。0.7.1 **网页**验收已用 `gemma4:31b` 确认调 `get_next_countdown`、答「未到期样例条目」（与 CLI 默认示例模型 `deepseek-r1:8b` 不是同一条验收路径；勿把网页截图当成 CLI/Ollama 默认模型的联调证据）。
 
 ## 2. 当前架构
 
@@ -54,9 +54,9 @@ CountdownStore（config.toml）
 
 | 工具 | 参数 | 行为 |
 |---|---|---|
-| `list_countdowns` | `within_hours?`、`include_disabled`（默认 false） | `GET /countdowns`；默认仍返回全部；`annotate` 加 `expired`（`remaining_seconds < 0`；`None` → 不标过期） |
+| `list_countdowns` | `within_hours?`、`include_disabled`（默认 false） | `GET /countdowns`；默认仍返回全部；`annotate` 加 `expired`（`next_remaining_seconds < 0`；`None` → 不标过期） |
 | `get_countdown` | `id` | `GET /countdowns/{id}` + `expired` |
-| `get_next_countdown` | **无参** | 拉 enabled 列表 → `pick_next`：只保留 `remaining_seconds >= 0`，取最小；空则 `{"countdown":null}` |
+| `get_next_countdown` | **无参** | 拉 enabled 列表 → `pick_next`：只保留 `next_remaining_seconds >= 0`，取最小；空则 `{"countdown":null}` |
 
 API 路由在 `src/api.rs`：`GET|POST /countdowns`，`GET|PUT|DELETE /countdowns/{id}`。`expired` **不由 API 下发**，MCP 层计算（注释 L413–414）。
 
@@ -103,7 +103,7 @@ Anthropic / AWS 工具写法强调：description 写清「做什么 / 何时用 
 | 8 | **description 写清用/别用**（厂商共识） | B | Anthropic tool definition best practices；AWS Bedrock action `description` / AgentCore 工具清晰度要求 |
 | 9 | **双令牌 + 回环默认**：模型面与业务面凭据隔离；demo 不做 TLS | A | README §1、§10 |
 | 10 | **Rust 选型要点（本 MVP）** | A | `rmcp` 3.6 streamable HTTP + axum nest；`async-openai` 显式 base/key；`rust-version 1.89`（rmcp 要求 ≥1.88，见 `countdown-mcp-facts-2026-10-22.md`） |
-| 11 | **业务域缺陷会透到 Agent**：每日重复过点后 `remaining_seconds` 仍为负，直到跨日 | A | `calculate_target_time` Daily 只锚「今天」；README §10；`pick_next` 注释 |
+| 11 | **同一字段两语义会透到 Agent**：`remaining_seconds` 是本周期 elapsed（Daily/Weekday 过点为负）；「下一个」须用 `next_*`（`next_occurrence`） | A | `calculate_target_time` vs `next_occurrence`；API `next_target_time`/`next_remaining_seconds`；MCP `pick_next` |
 
 迁移到真实传统业务时的最小模板（C，流程建议）：
 
@@ -135,8 +135,8 @@ Anthropic / AWS 工具写法强调：description 写清「做什么 / 何时用 
 
 | 意图 | 工具 | 服务端行为 |
 |---|---|---|
-| 有哪些 / 哪些过期了 / 浏览 | `list_countdowns` | 默认仍返回全部；每条加 `expired`（`remaining_seconds < 0`；`None` 不标过期） |
-| 最近 / 下一个 / 马上到期 | `get_next_countdown` | **无参**；`pick_next` 只保留 `remaining_seconds >= 0`，取最小；全无则 `{"countdown":null}` |
+| 有哪些 / 哪些过期了 / 浏览 | `list_countdowns` | 默认仍返回全部；每条加 `expired`（`next_remaining_seconds < 0`；`None` 不标过期） |
+| 最近 / 下一个 / 马上到期 | `get_next_countdown` | **无参**；`pick_next` 只保留 `next_remaining_seconds >= 0`，取最小；全无则 `{"countdown":null}` |
 | 已知 id | `get_countdown` | 单条 + `expired` |
 
 0.7.1 定稿刻意：**不**改 `list_countdowns` 的默认过滤；**不**靠改 description 让模型「从 list 里自己挑」。旧客户端与旧提示不被悄悄改语义；新意图用新工具承接。
@@ -156,10 +156,10 @@ Anthropic / AWS 工具写法强调：description 写清「做什么 / 何时用 
 
 ---
 
-### 4. `get_next` 判定与每日重复的已知限制
+### 4. `get_next` 判定与「同一字段两语义」
 
-- **闸门：** `is_upcoming` ≡ `remaining_seconds` 为 `Some(s)` 且 `s >= 0`；`pick_next` 在此集合上取最小 remaining。
-- **已知限制（已写入 README §10）：** 每日重复在当天目标过后，API 的 `remaining_seconds` 仍为负（`calculate_target_time` 的 Daily 分支只锚「今天」）。因此 `get_next_countdown` 会跳过它；`list_countdowns` 仍返回并标 `expired: true`。这是业务域缺陷透到 Agent 面，不是工具选型能单独修的——真业务接 AI 前先核「状态字段是否跨日/跨周期正确」。
+- **闸门：** `is_upcoming` ≡ `next_remaining_seconds` 为 `Some(s)` 且 `s >= 0`；`pick_next` 在此集合上取最小 `next_remaining_seconds`。
+- **根因（不是「Daily 算错/未滚日」）：** `remaining_seconds` / `target_time` 来自 `calculate_target_time`，对 Daily/Weekday 是**本周期 elapsed 显示**（过点故意为负，终端「was N ago」；Weekday 周末锚上周五）。Agent「下一个」若误用该字段，会把过点重复项当过期丢掉。修法：**只加不改**——`next_occurrence` + API `next_target_time` / `next_remaining_seconds`；MCP 的 pick/expired/`within_hours` 改吃 `next_*`。旧字段语义留给终端。
 
 ---
 
@@ -250,7 +250,7 @@ Anthropic / AWS 工具写法强调：description 写清「做什么 / 何时用 
 
 - 仅回环明文 HTTP，无 TLS、无限流、无令牌热加载。
 - MCP 审计未记协议层 `initialize` / `tools/list` 的 `rpc:*` 行。
-- **每日重复**：当天目标过后 API `remaining_seconds` 为负；`get_next_countdown` 跳过；`list` 仍返回并 `expired: true`。根因在 `lib.rs` `calculate_target_time` 的 Daily 分支只取「今天同时刻」，不过夜滚到明天。
+- **同一字段两语义（已修 P0）：** `remaining_seconds` 仍是本周期 elapsed（Daily/Weekday 过点为负，含 Weekday）；「下一个」改用 `next_remaining_seconds`（`next_occurrence`）。勿再写成「Daily 未滚日」。
 - Agent：无工具/工具失败一律「查不到」；模型须支持 tool calls。
 
 ### 6.2 流程待办（A，`countdown-backlog.md`）
@@ -329,7 +329,7 @@ countdown_agent  ──Bearer(入口令牌)──▶  countdown_mcp  ──Beare
 
 | 工具 | 签名要点 | 服务端保证 |
 |---|---|---|
-| `get_next_countdown` | **无参** | 在 `remaining_seconds >= 0` 中取最小；全过期或没有 → `{"countdown":null}`，**不**用过期条目充数 |
+| `get_next_countdown` | **无参** | 在 `next_remaining_seconds >= 0` 中取最小；全无 upcoming → `{"countdown":null}`，**不**用过期条目充数 |
 | `list_countdowns` | 可选 `within_hours` / `include_disabled`；默认仍返回全部 | 每条带服务端算的 `expired` |
 | `get_countdown` | 必填 `id` | 单条 + `expired` |
 
@@ -339,7 +339,7 @@ countdown_agent  ──Bearer(入口令牌)──▶  countdown_mcp  ──Beare
 
 API **不**下发 `expired`。MCP 在出站前：
 
-- `annotate`：`remaining_seconds` 为负数 → `expired: true`；为 `None` → `expired: false`（诚实：算不出目标就不谎称过期）。
+- `annotate`：`next_remaining_seconds` 为负数 → `expired: true`；为 `None` → `expired: false`（诚实：算不出下次目标就不谎称过期）。
 - `is_upcoming`：`Some(s) if s >= 0`。
 - `pick_next`：过滤 upcoming 后 `min_by_key` 剩余秒数。每日重复「当天目标已过、剩余仍为负」的条目在 next 中被跳过，仍出现在 list 并标 `expired: true`（已知限制，写入 README）。
 
