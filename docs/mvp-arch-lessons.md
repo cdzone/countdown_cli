@@ -1,11 +1,11 @@
 # countdown_cli MVP：架构与可复用经验（备忘）
 
-> 分享用定稿（2026-10-23）。基线：公开仓库 `cdzone/countdown_cli` 标签 `v0.7.1` → `d67d0f3`。
+> 分享用定稿（2026-10-23，随 0.7.2 小闸修订）。公开仓库 `cdzone/countdown_cli`。
 > 只含本项目技术内容；可供他人审查对照。
 
 > **性质**：给后续真实传统业务对照的备忘，不是又一套需求文档。  
 > **合并文件**：本路径唯一正文；禁止另起平行页。  
-> **基线**：`v0.7.1` → `d67d0f3`（树 `f0e59b7a`），标签已多方核绿（2026-10-23）。
+> **基线演进**：`v0.7.1`/`d67d0f3`（树 `f0e59b7a`）→ P0 `#13`/`2250cd3`（树 `9c2a66e5`）→ crate **0.7.2**（MCP `next_*` 错配 fail-closed；标签待打）。
 
 ## 1. 结论先行
 
@@ -17,7 +17,7 @@
 
 ### 2.1 组件与入口（A）
 
-单 crate `countdown_cli`（`Cargo.toml`：`version = "0.7.1"`，`rust-version = "1.89"`，`default-run = "countdown_cli"`）。Cargo 自动发现 `src/bin/`：
+单 crate `countdown_cli`（`Cargo.toml`：`version = "0.7.2"`，`rust-version = "1.89"`，`default-run = "countdown_cli"`）。Cargo 自动发现 `src/bin/`：
 
 | 进程 | 路径 | 默认监听 | 职责 |
 |---|---|---|---|
@@ -25,7 +25,7 @@
 | `countdown_mcp` | `src/bin/countdown_mcp.rs` | `127.0.0.1:8765`，路径 `/mcp` | 只读 MCP；不碰配置文件；只调 API |
 | `countdown_agent` | `src/bin/countdown_agent.rs` + `src/bin/agent/agui.rs` | `--serve` → `127.0.0.1:8780` | 本机 OpenAI 兼容网关（默认 Ollama `:11434/v1`）+ MCP 客户端；可选 AG-UI `POST /agui` + `web/dist` 页面 |
 
-鉴权共享：`src/auth.rs`（令牌表 SHA-256）、`src/audit.rs`（JSON Lines）。网页：`web/`（`@ag-ui/client` 1.0.3；`package.json` 的 `"version": "0.7.0"` 与 crate 0.7.1 尚未对齐——见缺口）。
+鉴权共享：`src/auth.rs`（令牌表 SHA-256）、`src/audit.rs`（JSON Lines）。网页：`web/`（`@ag-ui/client` 1.0.3；`package.json` 的 `"version": "0.7.0"` 与 crate 0.7.2 尚未对齐——见缺口）。
 
 ### 2.2 边界（A）
 
@@ -149,17 +149,17 @@ Anthropic / AWS 工具写法强调：description 写清「做什么 / 何时用 
 
 | 缝 | 含义 | 本仓库落点 |
 |---|---|---|
-| **fail-closed** | 上游失败、鉴权不过、工具链断 → 对外表现为「查不到」，不编造、不吞错误当成功 | Agent：工具 `isError` / 未调工具 → 「查不到」；MCP 对 404/401/403 用固定错误文案（401/403 不传 API body）；其他非 2xx 仍可能把上游 body 拼进工具错误消息（见 `fetch`） |
+| **fail-closed** | 上游失败、鉴权不过、工具链断、**契约字段缺失** → 对外表现为「查不到」/工具错误，不编造、不吞错误当成功 | Agent：工具 `isError` / 未调工具 → 「查不到」；MCP 对 404/401/403 用固定错误文案（401/403 不传 API body）；旧 API 缺 `next_*` → 反序列化失败 → `isError`（禁止成功+假空）；其他非 2xx 仍可能把上游 body 拼进工具错误消息（见 `fetch`） |
 | **诚实空** | 查询成功，但业务上确实没有合格条目 → **成功 + 明确空**（`countdown: null`），禁止拿过期条目充数 | `get_next_countdown` 全过期 / 无未到期时返回 `null` |
 
-另：**不要默认过滤过期。** 若 list 默认只留未到期，会吞掉「每日重复、当天已过点」仍应出现在「有哪些」里的条目。本版选择：list 全量 + `expired` 标记；「下一个」走专用工具。
+另：**不要默认过滤过期。** 若 list 默认只留未到期，会吞掉「一次性已过期」以及「仍应出现在浏览里」的条目。本版选择：list 全量 + `expired`（按 `next_remaining_seconds`）；「下一个」走专用工具。Daily/Weekday 过点后 `next_*` 仍为正 → list 里 `expired: false`，也会被 `get_next` 选中。
 
 ---
 
 ### 4. `get_next` 判定与「同一字段两语义」
 
 - **闸门：** `is_upcoming` ≡ `next_remaining_seconds` 为 `Some(s)` 且 `s >= 0`；`pick_next` 在此集合上取最小 `next_remaining_seconds`。
-- **根因（不是「Daily 算错/未滚日」）：** `remaining_seconds` / `target_time` 来自 `calculate_target_time`，对 Daily/Weekday 是**本周期 elapsed 显示**（过点故意为负，终端「was N ago」；Weekday 周末锚上周五）。Agent「下一个」若误用该字段，会把过点重复项当过期丢掉。修法：**只加不改**——`next_occurrence` + API `next_target_time` / `next_remaining_seconds`；MCP 的 pick/expired/`within_hours` 改吃 `next_*`。旧字段语义留给终端。
+- **根因（不是「Daily 算错/未滚日」）：** `remaining_seconds` / `target_time` 来自 `calculate_target_time`，对 Daily/Weekday 是**本周期 elapsed 显示**（过点故意为负，终端「was N ago」；Weekday 周末锚上周五）。Agent「下一个」若误用该字段，会把过点重复项当过期丢掉。修法：**只加不改**——`next_occurrence` + API `next_target_time` / `next_remaining_seconds`；MCP 的 pick/expired/`within_hours` 改吃 `next_*`，且**回给模型的 JSON 不再吐 `remaining_seconds`**（避免双字段歧义）。旧字段语义留给终端（`main.rs` 读 domain，不读 API）。
 
 ---
 
@@ -168,7 +168,8 @@ Anthropic / AWS 工具写法强调：description 写清「做什么 / 何时用 
 1. **`--api` 非回环先写 `.bak`：** 启用 API 时 `CountdownStore` 会补 id 并写 `*.toml.bak`（`src/lib.rs`）。必须先校验绑定地址再建 store；被拒启动不得碰用户文件——`tests/api_addr_rejected.rs` 锁住「无 `.bak`」。
 2. **MCP 默认会走 `HTTP_PROXY`：** 本机 API 若被代理劫持则工具全挂。`countdown_mcp`（及 agent 侧客户端）对上游 HTTP 显式 `.no_proxy()`；`tests/mcp_proxy_env.rs` 在死代理环境下仍能 list。
 3. **CI 上 `terminal-notifier` 同步 wait 卡启动：** 异步路径里同步等子进程会堵 `--api` 起来。现策略：非 macOS 不 spawn；集成测 `hanging_terminal_notifier_does_not_block_the_api`。macOS 通知路径仍有同步 `wait`、超时未统一加——见项目 backlog 中 0.5.1 通知超时项（不在本 git 树）。
-4. **网页验收必须看工具名，不只看自然语言：** 通过标准含工具名 = `get_next_countdown`（参数 `{}`）、答案为未到期业务条目、且不是列表里排前的已过期条目。只听中文答「好像对」会漏掉仍在调 `list_countdowns` 自挑的情况。
+4. **跨进程新增字段：消费方勿 `serde(default)`。** 只加字段时，若 MCP 对 `next_*` 用 `#[serde(default)]`，旧 API 缺字段会静默变 `None`，`get_next` 成功返回 `null`（假空，比错选更糟）。可迁移写法：字段必现、值可 null（`deserialize_with` + `Option::deserialize`），缺了就 `isError`。
+5. **网页验收必须看工具名，不只看自然语言：** 通过标准含工具名 = `get_next_countdown`（参数 `{}`）、答案为未到期业务条目、且不是列表里排前的已过期条目。只听中文答「好像对」会漏掉仍在调 `list_countdowns` 自挑的情况。
 
 （合入窗口类坑：鉴权曾拆成多 PR 时，规格接受「中间态 master 不打标签、不外发试用」的有条件窗口。推断：真业务多 PR 拆合时同样要显式写清窗口内允许什么。）
 
@@ -234,7 +235,7 @@ Anthropic / AWS 工具写法强调：description 写清「做什么 / 何时用 
 
 ### 5.4 验收自己「学会了」的信号
 
-- 能解释为何「列表浏览」和「下一个」要拆工具，以及默认过滤过期会踩什么坑（每日重复等）。
+- 能解释为何「列表浏览」和「下一个」要拆工具，以及默认过滤过期会踩什么坑（一次性已过期仍应可浏览；Daily 过点靠 `next_*` 仍 upcoming）。
 - 给定一次对话记录，能判断：调对工具了吗？是诚实空还是 fail-closed？
 - 换模型只改配置，不改业务规则代码，验收问法仍盯工具名 + 业务值。
 
@@ -263,14 +264,14 @@ Anthropic / AWS 工具写法强调：description 写清「做什么 / 何时用 
 
 1. **未在本机重跑** 1.89/1.99.1 全测与 clippy（仅见既有日志副本，未复跑）。
 2. **未打开** 远端 GitHub Actions 原始日志；CI 称绿处本文不重复断言。
-3. **`web/package.json` 仍标 0.7.0**：与 crate/标签 0.7.1 不一致是否有意，未问产品方。
+3. **`web/package.json` 仍标 0.7.0**：与 crate 0.7.2 不一致是否有意，未问产品方。
 4. **Anthropic「合并相关操作为更少工具」** 与「按意图拆工具」存在张力：本 MVP 选择拆开以避免模型从 list 猜；是否对所有业务成立未做对照实验（C）。
 5. **外部 IDE 接 MCP** 未在本轮实测（留给后续排期后的调研）。
-6. 本地 worktree 的 `HEAD` 可能落后；以 `origin/master`=`d67d0f3` / 树 `f0e59b7a` 为准。
+6. 本地 worktree 的 `HEAD` 可能落后；以已合入的 `origin/master` 为准（P0 后 tip 曾为 `2250cd3` / 树 `9c2a66e5`；本闸再叠 0.7.2）。
 
 ## 7. Rust / MCP 实现取舍
 
-> 本章只谈实现：crate / bin 边界、MCP 工具怎么钉行为、测试钉什么。产品闸门、令牌运维、网页验收口径见其他章。基线：公开仓库 `cdzone/countdown_cli` 标签 `v0.7.1`（MSRV 1.89，单 crate 多 bin）。
+> 本章只谈实现：crate / bin 边界、MCP 工具怎么钉行为、测试钉什么。产品闸门、令牌运维、网页验收口径见其他章。基线：公开仓库 `cdzone/countdown_cli` crate **0.7.2**（MSRV 1.89，单 crate 多 bin）。
 
 ### 7.1 本章范围
 
@@ -341,13 +342,14 @@ API **不**下发 `expired`。MCP 在出站前：
 
 - `annotate`：`next_remaining_seconds` 为负数 → `expired: true`；为 `None` → `expired: false`（诚实：算不出下次目标就不谎称过期）。
 - `is_upcoming`：`Some(s) if s >= 0`。
-- `pick_next`：过滤 upcoming 后 `min_by_key` 剩余秒数。每日重复「当天目标已过、剩余仍为负」的条目在 next 中被跳过，仍出现在 list 并标 `expired: true`（已知限制，写入 README）。
+- `pick_next`：过滤 upcoming 后 `min_by_key(next_remaining_seconds)`。Daily/Weekday 过点后 API 给出正向 `next_*`，故仍可被选中且 list 中 `expired: false`；**一次性**已过期（`next_remaining_seconds < 0`）才在 next 中被跳过、list 标 `expired: true`。
+- 出站视图：工具 JSON **不序列化** `remaining_seconds`；问「还有多久」只用 `next_*`。`next_*` 反序列化必填（缺字段 → 工具 `isError`）。
 
 这样「最近」与「列表是否含过期」是**确定性代码**，与模型是否听话无关。
 
 #### 7.3.3 `instructions` 与 description 互指
 
-`initialize` 时 `with_instructions(MCP_INSTRUCTIONS)`：三句话复述「问最近 → next；问有哪些／过期 → list；已知 id → get」。与各工具 description 同口径，形成**双通道**：协议层 instructions + 工具级 description。工具无单独版号，行为变更随应用版本（如 `0.7.1`）发布。
+`initialize` 时 `with_instructions(MCP_INSTRUCTIONS)` + `with_server_info(countdown_cli / CARGO_PKG_VERSION)`：三句话复述「问最近 → next；问有哪些／过期 → list；已知 id → get」。与各工具 description 同口径，形成**双通道**：协议层 instructions + 工具级 description。工具无单独版号，行为变更随应用版本（如 `0.7.2`）发布。
 
 #### 7.3.4 Agent 侧再钉一层白名单
 

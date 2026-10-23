@@ -17,7 +17,9 @@ use countdown_cli::{
 };
 use serde_json::{json, Value};
 
-use countdown_cli::{calculate_target_time, next_occurrence, Countdown, CountdownStore, RepeatMode};
+use countdown_cli::{
+    calculate_target_time, next_occurrence, Countdown, CountdownStore, RepeatMode,
+};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ApiCountdown {
@@ -562,7 +564,8 @@ mod tests {
 
     #[test]
     fn from_domain_daily_after_target_keeps_elapsed_and_adds_next() {
-        let now = NaiveDateTime::parse_from_str("2025-01-15 19:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+        let now =
+            NaiveDateTime::parse_from_str("2025-01-15 19:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
         let c = Countdown {
             id: Some("daily".into()),
             title: "standup".into(),
@@ -579,7 +582,8 @@ mod tests {
 
     #[test]
     fn from_domain_weekday_weekend_next_is_monday() {
-        let now = NaiveDateTime::parse_from_str("2025-01-18 10:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+        let now =
+            NaiveDateTime::parse_from_str("2025-01-18 10:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
         let c = Countdown {
             id: Some("wd".into()),
             title: "standup".into(),

@@ -124,11 +124,11 @@ MCP 入口的 `Origin` 校验：请求不带 `Origin` 放行；带了但不是 `
 
 | 工具 | 用途 |
 |---|---|
-| `get_next_countdown` | 无参。服务端挑 `next_remaining_seconds >= 0` 且最小的一条；没有则返回 `{"countdown":null}`，不拿过期的充数。问「最近／下一个」用它。 |
-| `list_countdowns` | 默认仍返回全部（可用 `within_hours` / `include_disabled` 过滤）；每条带服务端算的 `expired`。问「有哪些／哪些过期了」用它；**不要**用它来猜最近。 |
-| `get_countdown` | 按 id 取一条。 |
+| `get_next_countdown` | 无参。服务端挑 `next_remaining_seconds >= 0` 且最小的一条；没有则返回 `{"countdown":null}`，不拿过期的充数。问「最近／下一个／还有多久」用它，读返回的 `next_*`。 |
+| `list_countdowns` | 默认仍返回全部（可用 `within_hours` / `include_disabled` 过滤）；按 `next_remaining_seconds` 排序；每条带服务端算的 `expired`。问「有哪些／哪些过期了」用它；**不要**用它来猜最近。 |
+| `get_countdown` | 按 id 取一条（出站字段含 `next_*`，不含 `remaining_seconds`）。 |
 
-服务端 `initialize` 的 `instructions` 用三句话复述上述分工。工具无单独版号，行为变更随应用版本（如 `0.7.1`）发布。
+服务端 `initialize` 的 `instructions` 用三句话复述上述分工。工具无单独版号，行为变更随应用版本（如 `0.7.2`）发布。
 
 ## 5. 认证与失败返回
 
@@ -268,7 +268,7 @@ MCP_STORAGE_DIR=$(mktemp -d) npx @modelcontextprotocol/inspector@2.12.0 --cli \
 - 不做令牌热加载、限流、日志外送和服务内轮转；没有终端用户级别的权限，只认到「哪个程序在调」。
 - API 和 MCP 同写一个审计文件没有测过，不要这样配。
 - MCP 审计目前只记工具调用、启动探测异常和入口拒绝；规格要求的协议层请求（initialize、tools/list 等）的 `rpc:<方法>` 行本版还没有实现。
-- `remaining_seconds` / `target_time` 对 Daily/Weekday 是**本周期 elapsed 显示**（过点后为负，终端可显示「已过去多久」；Weekday 同）。Agent「下一个／过期／N 小时内」应看 API 追加的 `next_target_time` / `next_remaining_seconds`（`next_occurrence`）。MCP 的 `get_next_countdown`、`expired`、`within_hours` 已改吃 `next_*`；旧字段语义不变。
+- `remaining_seconds` / `target_time` 对 Daily/Weekday 是**本周期 elapsed 显示**（过点后为负，终端可显示「已过去多久」；Weekday 同）。Agent「下一个／过期／N 小时内」应看 API 追加的 `next_target_time` / `next_remaining_seconds`（`next_occurrence`）。MCP 的 `get_next_countdown`、`expired`、`within_hours` 已改吃 `next_*`，且工具回给模型的 JSON **不再包含** `remaining_seconds`；旧 API 缺 `next_*` 时 MCP 返回工具错误（fail-closed）。旧字段语义留给终端。
 
 ## 11. 命令行智能体 `countdown_agent`
 
