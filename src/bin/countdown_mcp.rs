@@ -151,6 +151,9 @@ struct Record<'a> {
     /// Application error code when the tool failed (MCP ErrorCode wire form).
     #[serde(skip_serializing_if = "Option::is_none")]
     code: Option<&'a str>,
+    /// Truncated upstream / parse detail for operators; never sent to the model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<&'a str>,
     duration_ms: u64,
 }
 
@@ -173,7 +176,10 @@ struct Failure {
     outcome: Outcome,
     upstream_status: Option<reqwest::StatusCode>,
     code: ErrorCode,
+    /// Fixed short text for the model (no URLs / serde internals).
     message: String,
+    /// Truncated detail for the audit line only.
+    detail: Option<String>,
 }
 
 /// One tool call (or the startup probe), correlated with the API side by
@@ -213,7 +219,9 @@ impl Upstream {
         is_error: Option<bool>,
         upstream_status: Option<reqwest::StatusCode>,
         code: Option<ErrorCode>,
+        detail: Option<&str>,
     ) {
+        let detail = detail.map(truncated);
         write_audit(
             audit,
             &Record {
@@ -231,6 +239,7 @@ impl Upstream {
                 is_error,
                 upstream_status: upstream_status.map(|s| s.as_u16()),
                 code: code.map(ErrorCode::as_str),
+                detail: detail.as_deref(),
                 duration_ms: self.started.elapsed().as_millis() as u64,
             },
         );
@@ -245,7 +254,7 @@ impl Upstream {
     ) -> Result<CallToolResult, McpError> {
         let mut result = match result {
             Ok(r) => {
-                self.record(audit, Outcome::Ok, Some(false), None, None);
+                self.record(audit, Outcome::Ok, Some(false), None, None, None);
                 r
             }
             Err(f) => {
@@ -255,6 +264,7 @@ impl Upstream {
                     Some(true),
                     f.upstream_status,
                     Some(f.code),
+                    f.detail.as_deref(),
                 );
                 tool_error(f.code, f.message)
             }
@@ -354,6 +364,7 @@ impl Entry {
                 is_error: None,
                 upstream_status: None,
                 code: None,
+                detail: None,
                 duration_ms: started.elapsed().as_millis() as u64,
             },
         );
@@ -625,18 +636,21 @@ impl CountdownMcp {
         url: reqwest::Url,
         up: &Upstream,
     ) -> Result<T, Failure> {
-        let fail = |outcome, upstream_status, code, message| Failure {
-            outcome,
-            upstream_status,
-            code,
-            message,
-        };
+        let fail =
+            |outcome, upstream_status, code, message: String, detail: Option<String>| Failure {
+                outcome,
+                upstream_status,
+                code,
+                message,
+                detail,
+            };
         let resp = self.get(url.clone(), up).send().await.map_err(|e| {
             fail(
                 Outcome::UpstreamUnreachable,
                 None,
                 ErrorCode::UpstreamUnavailable,
-                format!("countdown API unreachable at {url}: {e}"),
+                "countdown API unreachable".to_string(),
+                Some(format!("{url}: {e}")),
             )
         })?;
         let status = resp.status();
@@ -646,6 +660,7 @@ impl CountdownMcp {
                 Some(status),
                 ErrorCode::NotFound,
                 "countdown not found".to_string(),
+                None,
             ));
         }
         // The API's body is not passed on: it is not meant for the model.
@@ -655,6 +670,7 @@ impl CountdownMcp {
                 Some(status),
                 ErrorCode::Unauthenticated,
                 rejected_credential(status),
+                None,
             ));
         }
         if status == reqwest::StatusCode::FORBIDDEN {
@@ -663,6 +679,7 @@ impl CountdownMcp {
                 Some(status),
                 ErrorCode::PermissionDenied,
                 rejected_credential(status),
+                None,
             ));
         }
         if !status.is_success() {
@@ -689,14 +706,27 @@ impl CountdownMcp {
                 Some(status),
                 code,
                 format!("countdown API returned {status}"),
+                None,
             ));
         }
-        resp.json::<T>().await.map_err(|e| {
+        // Read bytes first so contract_mismatch detail keeps missing field names
+        // (resp.json() wraps serde errors inside a reqwest message that drops them).
+        let bytes = resp.bytes().await.map_err(|e| {
+            fail(
+                Outcome::UpstreamUnreachable,
+                Some(status),
+                ErrorCode::UpstreamUnavailable,
+                "countdown API unreachable".to_string(),
+                Some(e.to_string()),
+            )
+        })?;
+        serde_json::from_slice::<T>(&bytes).map_err(|e| {
             fail(
                 Outcome::Error,
                 Some(status),
                 ErrorCode::ContractMismatch,
-                format!("countdown API returned an unexpected body: {e}"),
+                "countdown API returned an unexpected body".to_string(),
+                Some(e.to_string()),
             )
         })
     }
@@ -710,7 +740,14 @@ impl CountdownMcp {
         let status = match self.get(url, &up).timeout(PROBE_TIMEOUT).send().await {
             Ok(resp) => resp.status(),
             Err(_) => {
-                up.record(&self.audit, Outcome::UpstreamUnreachable, None, None, None);
+                up.record(
+                    &self.audit,
+                    Outcome::UpstreamUnreachable,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
                 return Probe::Accepted;
             }
         };
@@ -722,11 +759,12 @@ impl CountdownMcp {
                     None,
                     Some(status),
                     None,
+                    None,
                 );
                 Probe::Rejected(status)
             }
             s if !s.is_success() => {
-                up.record(&self.audit, Outcome::Error, None, Some(s), None);
+                up.record(&self.audit, Outcome::Error, None, Some(s), None, None);
                 Probe::Accepted
             }
             _ => Probe::Accepted,
@@ -766,6 +804,7 @@ impl CountdownMcp {
                     upstream_status: None,
                     code: ErrorCode::Internal,
                     message: e.message.to_string(),
+                    detail: None,
                 })
             });
         up.finish(&self.audit, result)
@@ -790,6 +829,7 @@ impl CountdownMcp {
                 upstream_status: None,
                 code: ErrorCode::Internal,
                 message: e.message.to_string(),
+                detail: None,
             }),
             Err(mut f) => {
                 f.message = format!("{} (id: {id})", f.message);
@@ -826,6 +866,7 @@ impl CountdownMcp {
                     upstream_status: None,
                     code: ErrorCode::Internal,
                     message: e.message.to_string(),
+                    detail: None,
                 })
             });
         up.finish(&self.audit, result)
@@ -1025,12 +1066,17 @@ mod tests {
     const SERVICE_TOKEN: &str = "svc-token-0123456789abcdef0123456789abcdef";
 
     fn mcp(api_url: reqwest::Url) -> CountdownMcp {
+        mcp_with_audit(api_url).0
+    }
+
+    fn mcp_with_audit(api_url: reqwest::Url) -> (CountdownMcp, std::path::PathBuf) {
         let path = std::env::temp_dir().join(format!("mcp-unit-{}.jsonl", uuid::Uuid::new_v4()));
-        CountdownMcp::new(
+        let mcp = CountdownMcp::new(
             api_url,
             &ServiceToken::parse(SERVICE_TOKEN.as_bytes()).unwrap(),
             AuditLog::open(&path).unwrap(),
-        )
+        );
+        (mcp, path)
     }
 
     /// Request parts as rmcp hands them to a tool, optionally with a caller.
@@ -1060,7 +1106,15 @@ mod tests {
             })
             .collect();
         slim.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-        let actual = serde_json::json!({ "tools": slim });
+        let info = mcp("http://127.0.0.1:9".parse().unwrap()).get_info();
+        let actual = serde_json::json!({
+            "instructions": info.instructions,
+            "serverInfo": {
+                "name": info.server_info.name,
+                "version": info.server_info.version,
+            },
+            "tools": slim,
+        });
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp-tools.json");
         if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
@@ -1073,18 +1127,99 @@ mod tests {
             expected, actual,
             "mcp-tools.json drifted — update fixture + CHANGELOG + version together"
         );
-        // Hard guard: descriptions must not advertise the elapsed field
-        // `target_time` (substring of `next_target_time` is fine).
-        for t in actual["tools"].as_array().unwrap() {
-            let desc = t["description"].as_str().unwrap_or("");
-            assert!(
-                !desc.contains("title, target_time")
-                    && !desc.contains("not target_time")
-                    && !desc.contains("Returns id, title, target_time"),
-                "{} description still advertises target_time: {desc}",
-                t["name"]
-            );
+    }
+
+    /// Outbound model-view shapes via production `into_model` / tool path (not hand-written JSON).
+    #[tokio::test]
+    async fn mcp_tool_outputs_match_fixture() {
+        let morning = json!({
+            "id": "morning",
+            "title": "晨会",
+            "datetime": "2026-10-24 09:00:00",
+            "enabled": true,
+            "repeat": "daily",
+            "target_time": "2026-10-24 08:00:00",
+            "remaining_seconds": -3600,
+            "next_target_time": "2026-10-24 09:00:00",
+            "next_remaining_seconds": 3600,
+        });
+        let list_body = {
+            let morning = morning.clone();
+            move || {
+                let morning = morning.clone();
+                async move { Json(vec![morning]) }
+            }
+        };
+        let one = {
+            let morning = morning.clone();
+            move |Path(id): Path<String>| {
+                let morning = morning.clone();
+                async move {
+                    if id == "morning" {
+                        Json(morning).into_response()
+                    } else {
+                        (
+                            StatusCode::NOT_FOUND,
+                            Json(json!({"error":{"code":"not_found"}})),
+                        )
+                            .into_response()
+                    }
+                }
+            }
+        };
+        let app = Router::new()
+            .route("/countdowns", get(list_body))
+            .route("/countdowns/{id}", get(one));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url: reqwest::Url = format!("http://{addr}").parse().unwrap();
+        let mcp = mcp(url);
+
+        let list_r = mcp
+            .list_countdowns(list(None, false), anon())
+            .await
+            .unwrap();
+        assert_eq!(list_r.is_error, Some(false), "{}", text(&list_r));
+        let list_v: Value = serde_json::from_str(&text(&list_r)).unwrap();
+
+        let get_r = mcp
+            .get_countdown(get_args("morning"), anon())
+            .await
+            .unwrap();
+        assert_eq!(get_r.is_error, Some(false), "{}", text(&get_r));
+        let get_v: Value = serde_json::from_str(&text(&get_r)).unwrap();
+
+        let next_r = mcp.get_next_countdown(anon()).await.unwrap();
+        assert_eq!(next_r.is_error, Some(false), "{}", text(&next_r));
+        let next_v: Value = serde_json::from_str(&text(&next_r)).unwrap();
+
+        // Empty next: production type, no upcoming items.
+        let empty = NextCountdown { countdown: None };
+        let empty_v = serde_json::to_value(&empty).unwrap();
+
+        let outputs = json!({
+            "list_countdowns": list_v,
+            "get_countdown": get_v,
+            "get_next_countdown": next_v,
+            "get_next_countdown_empty": empty_v,
+        });
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/mcp-tool-outputs.json");
+        if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
+            std::fs::write(
+                &path,
+                serde_json::to_string_pretty(&outputs).unwrap() + "\n",
+            )
+            .unwrap();
+            return;
         }
+        let expected: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            expected, outputs,
+            "mcp-tool-outputs.json drifted — update fixture + CHANGELOG + version together"
+        );
     }
 
     #[tokio::test]
@@ -1456,6 +1591,68 @@ mod tests {
             .unwrap();
         assert_eq!(r.is_error, Some(true), "{}", text(&r));
         assert_eq!(error_code_of(&r), Some("contract_mismatch"));
+    }
+
+    #[tokio::test]
+    async fn tool_error_text_never_contains_http_url() {
+        let mcp = mcp(unreachable_url().await);
+        let cases = [
+            mcp.list_countdowns(list(None, false), anon())
+                .await
+                .unwrap(),
+            mcp.get_countdown(get_args("x"), anon()).await.unwrap(),
+            mcp.get_next_countdown(anon()).await.unwrap(),
+        ];
+        for r in &cases {
+            assert_eq!(error_code_of(r), Some("upstream_unavailable"));
+            let t = text(r);
+            assert!(!t.contains("http://"), "{t}");
+            assert!(!t.contains("https://"), "{t}");
+            assert!(t.starts_with("countdown API unreachable"), "{t}");
+        }
+    }
+
+    #[tokio::test]
+    async fn contract_mismatch_audit_detail_keeps_missing_field_name() {
+        let body = json!([{
+            "id": "morning", "title": "晨会", "datetime": "2026-10-22 09:00:00",
+            "enabled": true, "repeat": "daily",
+            "target_time": "2026-10-22 09:00:00",
+            "remaining_seconds": -3600
+        }]);
+        let app = Router::new().route(
+            "/countdowns",
+            get(move || {
+                let body = body.clone();
+                async move { Json(body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url: reqwest::Url = format!("http://{addr}").parse().unwrap();
+        let (mcp, audit_path) = mcp_with_audit(url);
+
+        let r = mcp
+            .list_countdowns(list(None, false), anon())
+            .await
+            .unwrap();
+        assert_eq!(error_code_of(&r), Some("contract_mismatch"));
+        assert_eq!(text(&r), "countdown API returned an unexpected body");
+        assert!(!text(&r).contains("http://"), "{}", text(&r));
+
+        let lines: Vec<Value> = std::fs::read_to_string(&audit_path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let last = lines.last().expect("audit line");
+        assert_eq!(last["code"], "contract_mismatch");
+        let detail = last["detail"].as_str().expect("detail present");
+        assert!(
+            detail.contains("next_target_time"),
+            "detail should keep missing field name: {detail}"
+        );
     }
 
     #[tokio::test]
