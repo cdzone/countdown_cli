@@ -1,11 +1,11 @@
 # countdown_cli MVP：架构与可复用经验（备忘）
 
-> 分享用定稿（2026-10-23，随 0.7.3 结构化错误小闸修订）。公开仓库 `cdzone/countdown_cli`。
+> 分享用定稿（随 **0.8.0** 方案 A / ModelView；**0.8.1** 补文档与快照接线）。公开仓库 `cdzone/countdown_cli`。
 > 只含本项目技术内容；可供他人审查对照。
 
 > **性质**：给后续真实传统业务对照的备忘，不是又一套需求文档。  
 > **合并文件**：本路径唯一正文；禁止另起平行页。  
-> **基线演进**：`v0.7.1`/`d67d0f3`（树 `f0e59b7a`）→ P0 `#13`/`2250cd3`（树 `9c2a66e5`）→ `v0.7.2` / `f45f9a66`（树 `7d01e35c`；MCP `next_*` 错配 fail-closed）→ **`v0.7.3`**（HTTP↔MCP 共用应用级 error `code` + MCP `structuredContent.error`）。
+> **基线演进**：`v0.7.1` → `v0.7.2`（`next_*` fail-closed）→ `v0.7.3`（结构化 `error.code`）→ **`v0.8.0`**（方案 A：`HttpErrorCode` + MCP 映射；ModelView 无 `target_time`；契约快照初版）→ **`v0.8.1`**（快照接线 + 文案/审计诚实 + README/CHANGELOG）。
 
 ## 1. 结论先行
 
@@ -17,7 +17,7 @@
 
 ### 2.1 组件与入口（A）
 
-单 crate `countdown_cli`（`Cargo.toml`：`version = "0.7.3"`，`rust-version = "1.89"`，`default-run = "countdown_cli"`）。Cargo 自动发现 `src/bin/`：
+单 crate `countdown_cli`（`Cargo.toml`：`version = "0.8.0"`，`rust-version = "1.89"`，`default-run = "countdown_cli"`）。Cargo 自动发现 `src/bin/`：
 
 | 进程 | 路径 | 默认监听 | 职责 |
 |---|---|---|---|
@@ -25,7 +25,7 @@
 | `countdown_mcp` | `src/bin/countdown_mcp.rs` | `127.0.0.1:8765`，路径 `/mcp` | 只读 MCP；不碰配置文件；只调 API |
 | `countdown_agent` | `src/bin/countdown_agent.rs` + `src/bin/agent/agui.rs` | `--serve` → `127.0.0.1:8780` | 本机 OpenAI 兼容网关（默认 Ollama `:11434/v1`）+ MCP 客户端；可选 AG-UI `POST /agui` + `web/dist` 页面 |
 
-鉴权共享：`src/auth.rs`（令牌表 SHA-256）、`src/audit.rs`（JSON Lines）。网页：`web/`（`@ag-ui/client` 1.0.3；`package.json` 的 `"version": "0.7.0"` 与 crate 0.7.3 尚未对齐——见缺口）。
+鉴权共享：`src/auth.rs`（令牌表 SHA-256）、`src/audit.rs`（JSON Lines）。网页：`web/`（`@ag-ui/client` 1.0.3；`package.json` 的 `"version": "0.7.0"` 与 crate 0.8.0 尚未对齐——见缺口）。
 
 ### 2.2 边界（A）
 
@@ -197,7 +197,7 @@ Anthropic / AWS 工具写法强调：description 写清「做什么 / 何时用 
 
 ## 5. 「业务系统接 AI」学习要点
 
-> 基线同备忘 `v0.7.3`（叠 `v0.7.2` / `f45f9a66`）。只写可迁移的学习对照。与「闸门与缝」互补：那边钉工程缝，这边钉**怎么练、怎么验收自己学会了**。
+> 基线同备忘 `v0.8.0`（叠 `v0.7.2` / `f45f9a66`）。只写可迁移的学习对照。与「闸门与缝」互补：那边钉工程缝，这边钉**怎么练、怎么验收自己学会了**。
 
 ### 5.1 先建立心智模型（三层）
 
@@ -275,12 +275,12 @@ Anthropic / AWS 工具写法强调：description 写清「做什么 / 何时用 
 
 ### 6.3 本短文未核到的缺口
 
-1. **未在本机重跑** 1.89/1.99.1 全测与 clippy（仅见既有日志副本，未复跑）。
+1. **MSRV / clippy：** CI 已跑 MSRV 1.89（含 clippy 与测试）；本备忘不再写「未在本机重跑 1.89」。
 2. **未打开** 远端 GitHub Actions 原始日志；CI 称绿处本文不重复断言。
 3. **`web/package.json` 仍标 0.7.0**：与 crate 0.8.0 不一致是否有意，未问产品方。
 4. **Anthropic「合并相关操作为更少工具」** 与「按意图拆工具」存在张力：本 MVP 选择拆开以避免模型从 list 猜；是否对所有业务成立未做对照实验（C）。
 5. **外部 IDE 接 MCP** 未在本轮实测（留给后续排期后的调研）。
-6. 本地 worktree 的 `HEAD` 可能落后；以已合入的 `origin/master` 为准（P0 后 tip 曾为 `2250cd3` / 树 `9c2a66e5`；0.7.3 后再叠 0.8.0（mbox / 未合 master 前以分支为准））。
+6. 以已合入的 `origin/master` / 标签为准（`v0.8.0` → `60662425`；其后以 `v0.8.1` 为准）。
 
 ### 6.4 错误契约（结构化错误；**0.8.0 已落地，方案 A**）
 
@@ -391,7 +391,7 @@ API **不**下发 `expired`。MCP 在出站前：
 
 #### 7.3.3 `instructions` 与 description 互指
 
-`initialize` 时 `with_instructions(MCP_INSTRUCTIONS)` + `with_server_info(countdown_cli / CARGO_PKG_VERSION)`：三句话复述「问最近 → next；问有哪些／过期 → list；已知 id → get」。与各工具 description 同口径，形成**双通道**：协议层 instructions + 工具级 description。工具无单独版号，行为变更随应用版本（如 `0.7.3`）发布。
+`initialize` 时 `with_instructions(MCP_INSTRUCTIONS)` + `with_server_info(countdown_cli / CARGO_PKG_VERSION)`：三句话复述「问最近 → next；问有哪些／过期 → list；已知 id → get」。与各工具 description 同口径，形成**双通道**：协议层 instructions + 工具级 description。工具无单独版号，行为变更随应用版本（如 `0.8.0`）发布。
 
 #### 7.3.4 Agent 侧再钉一层白名单
 

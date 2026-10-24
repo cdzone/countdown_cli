@@ -6,6 +6,8 @@
 
 > **不兼容变更（0.5.0）：** `--api` 现在必须配 `--api-tokens`，不配就以退出码 2 拒绝启动；`countdown_mcp` 必须配 `--api-token-file` 和 `--tokens`。
 
+> **不兼容变更（0.8.0）：** HTTP 401/403 体码改回 `unauthorized` / `forbidden`（撤回 0.7.3 的 `unauthenticated` / `permission_denied`）；MCP 出站模型视图去掉 `target_time`。详见 [CHANGELOG](CHANGELOG.md)。
+
 ## 1. 架构与两套令牌
 
 ```
@@ -128,7 +130,7 @@ MCP 入口的 `Origin` 校验：请求不带 `Origin` 放行；带了但不是 `
 | `list_countdowns` | 默认仍返回全部（可用 `within_hours` / `include_disabled` 过滤）；按 `next_remaining_seconds` 排序；每条带服务端算的 `expired`。问「有哪些／哪些过期了」用它；**不要**用它来猜最近。 |
 | `get_countdown` | 按 id 取一条（出站字段含 `next_*`，不含 `remaining_seconds`）。 |
 
-服务端 `initialize` 的 `instructions` 用三句话复述上述分工。工具无单独版号，行为变更随应用版本（如 `0.7.3`）发布。
+服务端 `initialize` 的 `instructions` 用三句话复述上述分工。工具无单独版号，行为变更随应用版本（如 `0.8.0`）发布。
 
 ## 5. 认证与失败返回
 
@@ -149,7 +151,7 @@ MCP 入口的 `Origin` 校验：请求不带 `Origin` 放行；带了但不是 `
 
 - MCP 入口：没带、格式不对或令牌无效一律 HTTP 401（带 `WWW-Authenticate: Bearer realm="countdown"`，不带 scope；`error="invalid_token"` 的规则同 API：只有 `Bearer` 没令牌或令牌未知才带，`Basic xxx` 不带），在进入 MCP 协议处理之前拦下，未知路径（如 `/nope`）也一样；多个 `Authorization` 头只看第一个。403 只用于坏 `Origin`（先认证，令牌无效时即使 Origin 也坏也是 401）。
 - API 拒绝 MCP 的服务令牌时，工具结果 `isError: true`，正文固定为 `countdown API rejected the MCP service credential (HTTP 401)`（或 403），不附 API 返回的 body；`structuredContent.error.code` 为 `unauthenticated`（401）或 `permission_denied`（403）。
-- 其他失败也是 `isError: true` 的工具结果：`content` 为人读句，**`structuredContent.error = { code, message }`** 为机读码（与 HTTP 共用应用级 code 表）。审计 `outcome` 分别为：API 连不上 `upstream_unreachable`，API 返回 404 `not_found`，契约错配（如缺 `next_*`）`error` + 应用码 `contract_mismatch`，其他非 2xx `error`；上游拒绝凭据为 `upstream_auth_failed`，并带 `upstream_status`。客户端/夹具**只认 `code`，禁止靠 message 子串分支**。
+- 其他失败也是 `isError: true` 的工具结果：`content` 为人读句，**`structuredContent.error = { code, message }`** 为机读码（**MCP 侧 `ErrorCode`**；HTTP 用自有 `HttpErrorCode`，401/403 为 `unauthorized`/`forbidden`，边界映射到 MCP，见 docs §6.4）。审计 `outcome` 分别为：API 连不上 `upstream_unreachable`，API 返回 404 `not_found`，契约错配（如缺 `next_*`）`error` + 应用码 `contract_mismatch`，其他非 2xx `error`；上游拒绝凭据为 `upstream_auth_failed`，并带 `upstream_status`。客户端/夹具**只认 `code`，禁止靠 message 子串分支**。
 
 示例（令牌已打码，完整输出见 PR 附件）：
 
@@ -157,13 +159,13 @@ MCP 入口的 `Origin` 校验：请求不带 `Origin` 放行；带了但不是 `
 $ curl -s -i http://127.0.0.1:8080/countdowns
 HTTP/1.1 401 Unauthorized
 www-authenticate: Bearer realm="countdown", scope="countdowns:read"
-{"error":{"code":"unauthenticated","message":"missing bearer token"}}
+{"error":{"code":"unauthorized","message":"missing bearer token"}}
 
 $ curl -s -i -H "Authorization: Bearer $(cat mcp-svc.token)" -X POST \
     -H 'Content-Type: application/json' -d '{"title":"x"}' http://127.0.0.1:8080/countdowns
 HTTP/1.1 403 Forbidden
 www-authenticate: Bearer error="insufficient_scope", scope="countdowns:write"
-{"error":{"code":"permission_denied","message":"insufficient scope"}}
+{"error":{"code":"forbidden","message":"insufficient scope"}}
 ```
 
 ## 6. 审计日志
@@ -268,7 +270,7 @@ MCP_STORAGE_DIR=$(mktemp -d) npx @modelcontextprotocol/inspector@2.12.0 --cli \
 - 不做令牌热加载、限流、日志外送和服务内轮转；没有终端用户级别的权限，只认到「哪个程序在调」。
 - API 和 MCP 同写一个审计文件没有测过，不要这样配。
 - MCP 审计目前只记工具调用、启动探测异常和入口拒绝；规格要求的协议层请求（initialize、tools/list 等）的 `rpc:<方法>` 行本版还没有实现。
-- `remaining_seconds` / `target_time` 对 Daily/Weekday 是**本周期 elapsed 显示**（过点后为负，终端可显示「已过去多久」；Weekday 同）。Agent「下一个／过期／N 小时内」应看 API 追加的 `next_target_time` / `next_remaining_seconds`（`next_occurrence`）。MCP 的 `get_next_countdown`、`expired`、`within_hours` 已改吃 `next_*`，且工具回给模型的 JSON **不再包含** `remaining_seconds`；旧 API 缺 `next_*` 时 MCP 返回工具错误（fail-closed）。旧字段语义留给终端。
+- `remaining_seconds` / `target_time` 对 Daily/Weekday 是**本周期 elapsed 显示**（过点后为负，终端可显示「已过去多久」；Weekday 同）。Agent「下一个／过期／N 小时内」应看 API 追加的 `next_target_time` / `next_remaining_seconds`（`next_occurrence`）。MCP 的 `get_next_countdown`、`expired`、`within_hours` 已改吃 `next_*`，且工具回给模型的 JSON **不再包含** `remaining_seconds` 与 `target_time`；旧 API 缺 `next_*` 时 MCP 返回工具错误（fail-closed）。旧字段语义留给终端。
 
 ## 11. 命令行智能体 `countdown_agent`
 
