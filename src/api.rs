@@ -97,10 +97,11 @@ fn api_error(code: HttpErrorCode, message: impl Into<String>, status: StatusCode
     (status, Json(body)).into_response()
 }
 
-fn internal_error<E: std::fmt::Display>(e: E) -> Response {
+fn internal_error<E: std::fmt::Display>(_e: E) -> Response {
+    // Fixed short message: OS / IO detail stays off the wire (clients branch on code).
     api_error(
         HttpErrorCode::Internal,
-        e.to_string(),
+        "internal",
         StatusCode::INTERNAL_SERVER_ERROR,
     )
 }
@@ -1379,6 +1380,200 @@ datetime = "2026-12-31 00:00:00"
             attempt["params"],
             serde_json::json!({"fields": ["title", "datetime"], "title_len": marker.len()})
         );
+    }
+
+    fn fixtures_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+    }
+
+    fn assert_http_error_snapshot(actual: serde_json::Value) {
+        let path = fixtures_dir().join("http-error-bodies.json");
+        if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
+            let body = serde_json::to_string_pretty(&actual).unwrap() + "\n";
+            fs::write(&path, body).unwrap();
+            return;
+        }
+        let expected: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            expected, actual,
+            "http-error-bodies.json drifted — update fixture + CHANGELOG + version together"
+        );
+    }
+
+    /// HTTP error bodies from real routes (not hand-written messages).
+    #[tokio::test]
+    async fn http_error_bodies_match_fixture() {
+        let (router, _store, _dir, path) = setup_router_with_file(&sample_toml()).await;
+        let mut bodies = serde_json::Map::new();
+
+        let r = send(&router, "GET", "/countdowns", &[], "").await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+        bodies.insert(
+            "unauthorized".into(),
+            serde_json::from_str(&r.body).unwrap(),
+        );
+
+        let r = send(
+            &router,
+            "POST",
+            "/countdowns",
+            &[("authorization", READ_AUTH)],
+            GOOD_BODY,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN);
+        bodies.insert("forbidden".into(), serde_json::from_str(&r.body).unwrap());
+
+        let r = send(
+            &router,
+            "GET",
+            "/countdowns/does-not-exist",
+            &[("authorization", READ_AUTH)],
+            "",
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND);
+        bodies.insert("not_found".into(), serde_json::from_str(&r.body).unwrap());
+
+        let r = send(
+            &router,
+            "POST",
+            "/countdowns",
+            &[("authorization", WRITE_AUTH)],
+            r#"{"title":"","datetime":"2026-01-01 00:00:00"}"#,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+        bodies.insert(
+            "invalid_body".into(),
+            serde_json::from_str(&r.body).unwrap(),
+        );
+
+        let r = send(
+            &router,
+            "POST",
+            "/countdowns",
+            &[("authorization", WRITE_AUTH)],
+            r#"{"title":"X","datetime":"BAD"}"#,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+        bodies.insert(
+            "invalid_datetime".into(),
+            serde_json::from_str(&r.body).unwrap(),
+        );
+
+        let r = send(
+            &router,
+            "POST",
+            "/countdowns",
+            &[("authorization", WRITE_AUTH)],
+            r#"{"title":"X","datetime":"2026-01-01 00:00:00","repeat":"x"}"#,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+        bodies.insert(
+            "invalid_repeat".into(),
+            serde_json::from_str(&r.body).unwrap(),
+        );
+
+        // Payload too large: body over the 2 MiB guard.
+        let oversized = format!(
+            r#"{{"title":"{}","datetime":"2026-01-01 00:00:00"}}"#,
+            "x".repeat(2 * 1024 * 1024)
+        );
+        let r = send(
+            &router,
+            "POST",
+            "/countdowns",
+            &[("authorization", WRITE_AUTH)],
+            &oversized,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE);
+        bodies.insert(
+            "payload_too_large".into(),
+            serde_json::from_str(&r.body).unwrap(),
+        );
+
+        break_audit(&path);
+        let r = send(
+            &router,
+            "POST",
+            "/countdowns",
+            &[("authorization", WRITE_AUTH)],
+            GOOD_BODY,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(r.code(), "audit_unavailable");
+        bodies.insert(
+            "audit_unavailable".into(),
+            serde_json::from_str(&r.body).unwrap(),
+        );
+
+        // Internal: force IO error on write (unix); message is fixed "internal".
+        let dir = tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        fs::write(&cfg, sample_toml()).unwrap();
+        let store = CountdownStore::new(cfg.clone(), true).await.unwrap();
+        let audit = tempdir().unwrap();
+        let router = build_router(store, test_gate(&audit.path().join("a.jsonl")));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = fs::metadata(dir.path()).unwrap().permissions();
+            perm.set_mode(0o555);
+            fs::set_permissions(dir.path(), perm).unwrap();
+        }
+        let r = send(
+            &router,
+            "POST",
+            "/countdowns",
+            &[("authorization", WRITE_AUTH)],
+            GOOD_BODY,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(r.code(), "internal");
+        bodies.insert("internal".into(), serde_json::from_str(&r.body).unwrap());
+
+        // Restore dir perms so tempdir cleanup works.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = fs::metadata(dir.path()).unwrap().permissions();
+            perm.set_mode(0o755);
+            fs::set_permissions(dir.path(), perm).unwrap();
+        }
+
+        let actual = serde_json::Value::Object(bodies);
+        // Stable key order for fixture readability.
+        let mut keys: Vec<_> = actual.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        let ordered = serde_json::Value::Object(
+            keys.into_iter()
+                .map(|k| (k.clone(), actual[&k].clone()))
+                .collect(),
+        );
+        assert_http_error_snapshot(ordered.clone());
+
+        for code in [
+            HttpErrorCode::Unauthorized,
+            HttpErrorCode::Forbidden,
+            HttpErrorCode::NotFound,
+            HttpErrorCode::InvalidBody,
+            HttpErrorCode::InvalidDatetime,
+            HttpErrorCode::InvalidRepeat,
+            HttpErrorCode::PayloadTooLarge,
+            HttpErrorCode::AuditUnavailable,
+            HttpErrorCode::Internal,
+        ] {
+            let key = code.as_str();
+            assert_eq!(ordered[key]["error"]["code"], key);
+            let _ = code.to_mcp();
+        }
     }
 
     /// Makes the audit path unwritable by putting a directory there.
