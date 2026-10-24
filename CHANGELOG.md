@@ -4,6 +4,7 @@
 
 ## 0.8.1
 
+- **CI / 依赖：** `Cargo.lock` 将 tokio 升至 **1.54.1**（≥1.53.3），消 RUSTSEC-2026-0386（`AsyncFd` unsound）。非本闸功能引入——基线锁在 advisory 日更后同红；只动 lock，未改 `Cargo.toml` 直接依赖声明。（web/npm audit / zod 另议，本笔不动。）
 - **文档：** README HTTP 示例码名改回 `unauthorized` / `forbidden`；标明 HTTP 自有码表与 MCP `ErrorCode` 边界映射；补 0.8.0 不兼容提示与 CHANGELOG 链接；出站说明补「不含 `target_time`」。文首/§6.3 基线 scrub。
 - **契约快照诚实：** 出站快照改走生产 `into_model`/真工具（桩 API）；HTTP 错误体快照改从真实路由取响应；tools 快照补上 `instructions` 与 `serverInfo`（name/version）。去掉按措辞拦 `target_time` 的字符护栏。
 - **错误文案 / 审计：** 给模型的文案按码固定短句，不再含 `http(s)://` 或完整 API URL；审计 `Record` 增加截断 `detail`；成功体先 `bytes` 再 `from_slice`，`contract_mismatch` 时 detail 保留缺失字段名。
