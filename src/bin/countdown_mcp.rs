@@ -21,7 +21,7 @@ use axum::{
 };
 use clap::Parser;
 use countdown_cli::{
-    audit::{truncated, AuditLog},
+    audit::{error_chain, truncated, truncated_detail, AuditLog},
     auth::{bearer_challenge, read_token_file, TokenFileError, TokenTable},
     error::{ErrorCode, HttpErrorCode},
 };
@@ -221,7 +221,7 @@ impl Upstream {
         code: Option<ErrorCode>,
         detail: Option<&str>,
     ) {
-        let detail = detail.map(truncated);
+        let detail = detail.map(truncated_detail);
         write_audit(
             audit,
             &Record {
@@ -644,13 +644,15 @@ impl CountdownMcp {
                 message,
                 detail,
             };
-        let resp = self.get(url.clone(), up).send().await.map_err(|e| {
+        // Detail is for operators only: no URL (api_url is already in config),
+        // and walk source() so connection refused / TLS causes survive truncation.
+        let resp = self.get(url, up).send().await.map_err(|e| {
             fail(
                 Outcome::UpstreamUnreachable,
                 None,
                 ErrorCode::UpstreamUnavailable,
                 "countdown API unreachable".to_string(),
-                Some(format!("{url}: {e}")),
+                Some(error_chain(&e)),
             )
         })?;
         let status = resp.status();
@@ -717,7 +719,7 @@ impl CountdownMcp {
                 Some(status),
                 ErrorCode::UpstreamUnavailable,
                 "countdown API unreachable".to_string(),
-                Some(e.to_string()),
+                Some(error_chain(&e)),
             )
         })?;
         serde_json::from_slice::<T>(&bytes).map_err(|e| {
@@ -1652,6 +1654,44 @@ mod tests {
         assert!(
             detail.contains("next_target_time"),
             "detail should keep missing field name: {detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_unreachable_audit_detail_keeps_connect_reason() {
+        let url = unreachable_url().await;
+        let (mcp, audit_path) = mcp_with_audit(url);
+        let r = mcp
+            .list_countdowns(list(None, false), anon())
+            .await
+            .unwrap();
+        assert_eq!(error_code_of(&r), Some("upstream_unavailable"));
+        assert_eq!(text(&r), "countdown API unreachable");
+
+        let lines: Vec<Value> = std::fs::read_to_string(&audit_path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let last = lines.last().expect("audit line");
+        assert_eq!(last["code"], "upstream_unavailable");
+        let detail = last["detail"].as_str().expect("detail present");
+        assert!(
+            !detail.starts_with("http://") && !detail.starts_with("https://"),
+            "detail must not lead with the API URL: {detail}"
+        );
+        let lower = detail.to_ascii_lowercase();
+        assert!(
+            lower.contains("refused")
+                || lower.contains("connect")
+                || lower.contains("error sending request")
+                || lower.contains("connection"),
+            "detail should keep a connect-class reason: {detail}"
+        );
+        assert!(
+            detail.chars().count() <= countdown_cli::audit::MAX_AUDIT_DETAIL,
+            "detail exceeds MAX_AUDIT_DETAIL: {}",
+            detail.chars().count()
         );
     }
 

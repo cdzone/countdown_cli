@@ -14,13 +14,39 @@ use std::{
 
 use serde::Serialize;
 
-/// Cap, in characters, for caller-supplied strings copied into audit lines.
+/// Cap, in characters, for caller-supplied strings copied into audit lines
+/// (caller id, title, path segments, on_behalf_of, …).
 pub const MAX_AUDIT_STR: usize = 64;
 
-/// The first `MAX_AUDIT_STR` characters of `s`; cuts on char boundaries, so
-/// multi-byte UTF-8 is never split.
+/// Cap for operator-facing `detail` (error chains, serde paths). Longer than
+/// [`MAX_AUDIT_STR`] so a URL or title cannot eat the whole budget.
+pub const MAX_AUDIT_DETAIL: usize = 512;
+
+/// The first `max` characters of `s`; cuts on char boundaries, so multi-byte
+/// UTF-8 is never split.
+pub fn truncated_at(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+/// The first [`MAX_AUDIT_STR`] characters of `s`.
 pub fn truncated(s: &str) -> String {
-    s.chars().take(MAX_AUDIT_STR).collect()
+    truncated_at(s, MAX_AUDIT_STR)
+}
+
+/// The first [`MAX_AUDIT_DETAIL`] characters of `s`.
+pub fn truncated_detail(s: &str) -> String {
+    truncated_at(s, MAX_AUDIT_DETAIL)
+}
+
+/// `Display` of `err` plus each `source()`, joined with `": "`.
+pub fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut cur = err.source();
+    while let Some(e) = cur {
+        parts.push(e.to_string());
+        cur = e.source();
+    }
+    parts.join(": ")
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +94,40 @@ mod tests {
         let cut = truncated(&wide);
         assert_eq!(cut.chars().count(), 64);
         assert_eq!(cut, "倒".repeat(64));
+    }
+
+    #[test]
+    fn truncated_detail_allows_512_chars() {
+        let ascii = "b".repeat(600);
+        assert_eq!(truncated_detail(&ascii).chars().count(), MAX_AUDIT_DETAIL);
+        assert_eq!(truncated_at("xy", 1), "x");
+    }
+
+    #[test]
+    fn error_chain_joins_sources() {
+        #[derive(Debug)]
+        struct Leaf;
+        impl std::fmt::Display for Leaf {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "leaf-reason")
+            }
+        }
+        impl std::error::Error for Leaf {}
+
+        #[derive(Debug)]
+        struct Wrap(Leaf);
+        impl std::fmt::Display for Wrap {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "wrap")
+            }
+        }
+        impl std::error::Error for Wrap {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        assert_eq!(error_chain(&Wrap(Leaf)), "wrap: leaf-reason");
     }
     use serde_json::{json, Value};
 

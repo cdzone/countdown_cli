@@ -2,6 +2,11 @@
 
 本文件记录对外契约与版本边界。契约快照（`tests/fixtures/mcp-*.json`、`http-error-bodies.json`）变更时须同步更新本文件并决定版本号。
 
+## 0.8.2
+
+- **审计 detail 有用：** MCP 上游连不上时，审计 `detail` 不再拼 API URL，改为 `Display` + `source()` 链；`detail` 单独上限 512（caller/title/id 仍 64）。HTTP `internal`（写盘失败等）在丢弃错误前把原因写入 API 审计 `AuditLine.detail`；客户端体仍固定 `internal`。
+- **快照 version：** tools 快照有意保留 `serverInfo.version`，升版须同 PR 更新夹具（与 CHANGELOG / `Cargo.toml` 一并）。
+
 ## 0.8.1
 
 - **CI / 依赖：** `Cargo.lock` 将 tokio 升至 **1.54.1**（≥1.53.3），消 RUSTSEC-2026-0386（`AsyncFd` unsound）。非本闸功能引入——基线锁在 advisory 日更后同红；只动 lock，未改 `Cargo.toml` 直接依赖声明。
