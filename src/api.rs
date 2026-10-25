@@ -11,7 +11,7 @@ use axum::{
 };
 use chrono::{Local, NaiveDateTime};
 use countdown_cli::{
-    audit::{truncated, AuditLog},
+    audit::{error_chain, truncated, truncated_detail, AuditLog},
     auth::{bearer_challenge, Principal, Scope, TokenTable},
     error::HttpErrorCode,
     CountdownUpdateError,
@@ -97,13 +97,21 @@ fn api_error(code: HttpErrorCode, message: impl Into<String>, status: StatusCode
     (status, Json(body)).into_response()
 }
 
-fn internal_error<E: std::fmt::Display>(_e: E) -> Response {
+/// Operator-facing detail stashed on the response for [`Gate::finish`]; never
+/// serialized into the HTTP body.
+#[derive(Clone)]
+struct AuditDetail(String);
+
+fn internal_error(detail: impl Into<String>) -> Response {
     // Fixed short message: OS / IO detail stays off the wire (clients branch on code).
-    api_error(
+    let mut res = api_error(
         HttpErrorCode::Internal,
         "internal",
         StatusCode::INTERNAL_SERVER_ERROR,
-    )
+    );
+    res.extensions_mut()
+        .insert(AuditDetail(truncated_detail(&detail.into())));
+    res
 }
 
 #[derive(Clone)]
@@ -274,6 +282,9 @@ struct AuditLine {
     auth_fail: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<u16>,
+    /// Truncated operator detail (e.g. IO reason on `internal`); never on the wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     duration_ms: Option<u64>,
 }
@@ -309,6 +320,7 @@ impl AuditLine {
             outcome: None,
             auth_fail: None,
             status: None,
+            detail: None,
             duration_ms: None,
         }
     }
@@ -366,6 +378,9 @@ impl Gate {
         line.outcome = Some(outcome_of(res.status()));
         line.auth_fail = auth_fail;
         line.status = Some(res.status().as_u16());
+        if let Some(d) = res.extensions().get::<AuditDetail>() {
+            line.detail = Some(d.0.clone());
+        }
         line.duration_ms = Some(started.elapsed().as_millis() as u64);
         if self.audit.append(&line).is_err() {
             res.headers_mut()
@@ -525,7 +540,7 @@ async fn create_countdown(
             });
             (StatusCode::CREATED, Json(api)).into_response()
         }
-        Err(e) => internal_error(e),
+        Err(e) => internal_error(error_chain(e.as_ref())),
     }
 }
 
@@ -569,7 +584,7 @@ async fn delete_countdown(
             "Countdown not found",
             StatusCode::NOT_FOUND,
         ),
-        Err(e) => internal_error(e),
+        Err(e) => internal_error(error_chain(e.as_ref())),
     }
 }
 
@@ -1075,7 +1090,8 @@ datetime = "2026-12-31 00:00:00"
         fs::write(&path, sample_toml()).unwrap();
         let store = CountdownStore::new(path.clone(), true).await.unwrap();
         let audit = tempdir().unwrap();
-        let router = build_router(store.clone(), test_gate(&audit.path().join("a.jsonl")));
+        let audit_file = audit.path().join("a.jsonl");
+        let router = build_router(store.clone(), test_gate(&audit_file));
         // chmod dir to read/execute only (UNIX), after router created to force POST failure
         #[cfg(unix)]
         {
@@ -1103,14 +1119,56 @@ datetime = "2026-12-31 00:00:00"
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
         #[derive(serde::Deserialize)]
         struct E {
-            error: Code,
+            error: CodeMsg,
         }
         #[derive(serde::Deserialize)]
-        struct Code {
+        struct CodeMsg {
             code: String,
+            message: String,
         }
         let e: E = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(e.error.code, "internal");
+        assert_eq!(e.error.message, "internal");
+        let body_text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            !body_text.to_ascii_lowercase().contains("permission")
+                && !body_text.contains("os error"),
+            "response body must not leak OS detail: {body_text}"
+        );
+
+        // Restore dir perms before reading audit / tempdir cleanup.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = fs::metadata(dir.path()).unwrap().permissions();
+            perm.set_mode(0o755);
+            fs::set_permissions(dir.path(), perm).unwrap();
+        }
+
+        #[cfg(unix)]
+        {
+            let lines: Vec<serde_json::Value> = fs::read_to_string(&audit_file)
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            let result = lines
+                .iter()
+                .rev()
+                .find(|l| l["phase"] == "result")
+                .expect("result audit line");
+            assert_eq!(result["status"], 500);
+            assert_eq!(result["outcome"], "error");
+            let detail = result["detail"].as_str().expect("detail present");
+            let lower = detail.to_ascii_lowercase();
+            assert!(
+                lower.contains("permission")
+                    || lower.contains("os error")
+                    || lower.contains("read-only")
+                    || lower.contains("denied"),
+                "audit detail should keep the IO reason: {detail}"
+            );
+        }
     }
 
     #[tokio::test]

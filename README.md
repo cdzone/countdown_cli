@@ -130,7 +130,7 @@ MCP 入口的 `Origin` 校验：请求不带 `Origin` 放行；带了但不是 `
 | `list_countdowns` | 默认仍返回全部（可用 `within_hours` / `include_disabled` 过滤）；按 `next_remaining_seconds` 排序；每条带服务端算的 `expired`。问「有哪些／哪些过期了」用它；**不要**用它来猜最近。 |
 | `get_countdown` | 按 id 取一条（出站字段含 `next_*`，不含 `remaining_seconds`）。 |
 
-服务端 `initialize` 的 `instructions` 用三句话复述上述分工。工具无单独版号，行为变更随应用版本（如 `0.8.0`）发布。
+服务端 `initialize` 的 `instructions` 用三句话复述上述分工。工具无单独版号，行为变更随应用版本（如 `0.8.2`）发布。
 
 ## 5. 认证与失败返回
 
