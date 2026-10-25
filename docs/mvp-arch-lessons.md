@@ -1,11 +1,11 @@
 # countdown_cli MVP：架构与可复用经验（备忘）
 
-> 分享用定稿（随 **0.8.0** 方案 A / ModelView；**0.8.1** 补文档与快照接线）。公开仓库 `cdzone/countdown_cli`。
+> 分享用定稿（随 **0.8.0** 方案 A / ModelView；**0.8.1** 快照接线；**0.8.2** 审计 detail；本文基线 tip **0.8.2**）。公开仓库 `cdzone/countdown_cli`。
 > 只含本项目技术内容；可供他人审查对照。
 
 > **性质**：给后续真实传统业务对照的备忘，不是又一套需求文档。  
 > **合并文件**：本路径唯一正文；禁止另起平行页。  
-> **基线演进**：`v0.7.1` → `v0.7.2`（`next_*` fail-closed）→ `v0.7.3`（结构化 `error.code`）→ **`v0.8.0`**（方案 A：`HttpErrorCode` + MCP 映射；ModelView 无 `target_time`；契约快照初版）→ **`v0.8.1`**（快照接线 + 文案/审计诚实 + README/CHANGELOG）。
+> **基线演进**：`v0.7.1` → `v0.7.2`（`next_*` fail-closed）→ `v0.7.3`（结构化 `error.code`）→ **`v0.8.0`**（方案 A：`HttpErrorCode` + MCP 映射；ModelView 无 `target_time`；契约快照初版）→ **`v0.8.1`**（快照接线 + 文案/审计诚实）→ **`v0.8.2`**（审计 detail：连不上/`internal` 原因可查；tools 快照有意留 version）。
 
 ## 1. 结论先行
 
@@ -17,7 +17,7 @@
 
 ### 2.1 组件与入口（A）
 
-单 crate `countdown_cli`（`Cargo.toml`：`version = "0.8.0"`，`rust-version = "1.89"`，`default-run = "countdown_cli"`）。Cargo 自动发现 `src/bin/`：
+单 crate `countdown_cli`（`Cargo.toml`：`version = "0.8.2"`，`rust-version = "1.89"`，`default-run = "countdown_cli"`）。Cargo 自动发现 `src/bin/`：
 
 | 进程 | 路径 | 默认监听 | 职责 |
 |---|---|---|---|
@@ -25,7 +25,7 @@
 | `countdown_mcp` | `src/bin/countdown_mcp.rs` | `127.0.0.1:8765`，路径 `/mcp` | 只读 MCP；不碰配置文件；只调 API |
 | `countdown_agent` | `src/bin/countdown_agent.rs` + `src/bin/agent/agui.rs` | `--serve` → `127.0.0.1:8780` | 本机 OpenAI 兼容网关（默认 Ollama `:11434/v1`）+ MCP 客户端；可选 AG-UI `POST /agui` + `web/dist` 页面 |
 
-鉴权共享：`src/auth.rs`（令牌表 SHA-256）、`src/audit.rs`（JSON Lines）。网页：`web/`（`@ag-ui/client` 1.0.3；`package.json` 的 `"version": "0.7.0"` 与 crate 0.8.0 尚未对齐——见缺口）。
+鉴权共享：`src/auth.rs`（令牌表 SHA-256）、`src/audit.rs`（JSON Lines）。网页：`web/`（`@ag-ui/client` 1.0.3；`package.json` 的 `"version": "0.7.0"` 与 crate 0.8.2 尚未对齐——见缺口）。
 
 ### 2.2 边界（A）
 
@@ -54,11 +54,11 @@ CountdownStore（config.toml）
 
 | 工具 | 参数 | 行为 |
 |---|---|---|
-| `list_countdowns` | `within_hours?`、`include_disabled`（默认 false） | `GET /countdowns`；默认仍返回全部；`annotate` 加 `expired`（`next_remaining_seconds < 0`；`None` → 不标过期） |
+| `list_countdowns` | `within_hours?`、`include_disabled`（默认 false） | `GET /countdowns`；默认仍返回全部；`into_model` 加 `expired`（`next_remaining_seconds < 0`；`None` → 不标过期） |
 | `get_countdown` | `id` | `GET /countdowns/{id}` + `expired` |
 | `get_next_countdown` | **无参** | 拉 enabled 列表 → `pick_next`：只保留 `next_remaining_seconds >= 0`，取最小；空则 `{"countdown":null}` |
 
-API 路由在 `src/api.rs`：`GET|POST /countdowns`，`GET|PUT|DELETE /countdowns/{id}`。`expired` **不由 API 下发**，MCP 层计算（注释 L413–414）。
+API 路由在 `src/api.rs`：`GET|POST /countdowns`，`GET|PUT|DELETE /countdowns/{id}`。`expired` **不由 API 下发**，由 MCP `ApiCountdown::into_model` 计算。
 
 Agent 侧白名单：`TOOLS: [&str; 3]`；`connect_mcp` 过滤后只把这三项交给模型；调用时非白名单名不转发（`TOOLS.contains`）。系统提示强制「问最近 → `get_next_countdown`」。
 
@@ -70,7 +70,7 @@ Agent 侧白名单：`TOOLS: [&str; 3]`；`connect_mcp` 过滤后只把这三项
 | 工具 `description` | 各 `#[tool(description = "...")]` | **互指**：list 写明勿用于猜最近；get_next 写明勿用 list 代替 |
 | Agent `SYSTEM_PROMPT` | `countdown_agent.rs` | 中文复述同一分工；白名单再兜一层 |
 
-规范侧：MCP Tool 字段含 `name` / `description` / `inputSchema` 等，**无 per-tool `version`**（B：https://modelcontextprotocol.io/specification/2025-11-25/server/tools）。行为变更随应用版本（如 0.7.1）发布——与 README §4.3 一致（A）。
+规范侧：MCP Tool 字段含 `name` / `description` / `inputSchema` 等，**无 per-tool `version`**（B：https://modelcontextprotocol.io/specification/2025-11-25/server/tools）。行为变更随应用版本（如 0.8.2）发布——与 README §4.3 一致（A）。
 
 ## 3. 关键设计取舍
 
@@ -95,7 +95,7 @@ Anthropic / AWS 工具写法强调：description 写清「做什么 / 何时用 
 |---|---|---|---|
 | 1 | **工具按意图拆**：列表浏览 vs 「下一个/最近」分开；后者无参、服务端决出唯一条 | A | `get_next_countdown` / `pick_next`；网页验收截图（验收记录，不在本 git 树） |
 | 2 | **契约只加不改**：新工具 + 可选新字段；不改旧工具默认语义 | A | claims-vs-impl #2/#8；list 默认全量 + `expired` |
-| 3 | **规则放代码不放提示**：过期判定、最近挑选在 MCP；提示只做路由暗示 | A | `annotate` / `pick_next`；对比验收前后选型 |
+| 3 | **规则放代码不放提示**：过期判定、最近挑选在 MCP；提示只做路由暗示 | A | `into_model` / `pick_next`；对比验收前后选型 |
 | 4 | **三层说明一致**：instructions ↔ description 互指 ↔ Agent 系统提示；缺一层易漂移 | A | `MCP_INSTRUCTIONS`、两处 `#[tool(description)]`、`SYSTEM_PROMPT` |
 | 5 | **Agent 白名单 + fail-closed**：只 offer 已知工具；工具失败或未调工具 → 固定「查不到」 | A | `TOOLS`、`missing_tools`、文件头注释 |
 | 6 | **验收盯工具调用，不只盯自然语言**：标准含工具名、参数、答案业务值 | A | 验收口径；截图工具卡片 `get_next_countdown` `{}` |
@@ -121,7 +121,7 @@ Anthropic / AWS 工具写法强调：description 写清「做什么 / 何时用 
 
 本仓库落地：
 
-- 挑选与过期：`src/bin/countdown_mcp.rs` 的 `annotate` / `is_upcoming` / `pick_next`；API 不下发 `expired`。
+- 挑选与过期：`src/bin/countdown_mcp.rs` 的 `into_model`（0.7.x 曾名 `annotate`）/ `is_upcoming` / `pick_next`；API 不下发 `expired`。
 - 选型引导三层对齐：`MCP_INSTRUCTIONS`、各 `#[tool(description = "...")]` 互指「用/别用」、`countdown_agent` 的 `SYSTEM_PROMPT` + `TOOLS` 白名单。
 - 失败兜底：工具失败或模型未调工具 → 固定「查不到」（`countdown_agent.rs` 文件头与实现），不把模型临场话术当真相。
 
@@ -197,7 +197,7 @@ Anthropic / AWS 工具写法强调：description 写清「做什么 / 何时用 
 
 ## 5. 「业务系统接 AI」学习要点
 
-> 基线同备忘 `v0.8.0`（叠 `v0.7.2` / `f45f9a66`）。只写可迁移的学习对照。与「闸门与缝」互补：那边钉工程缝，这边钉**怎么练、怎么验收自己学会了**。
+> 基线同备忘 `v0.8.2`（叠 `v0.8.1` / `v0.8.0` 方案 A）。只写可迁移的学习对照。与「闸门与缝」互补：那边钉工程缝，这边钉**怎么练、怎么验收自己学会了**。
 
 ### 5.1 先建立心智模型（三层）
 
@@ -277,10 +277,10 @@ Anthropic / AWS 工具写法强调：description 写清「做什么 / 何时用 
 
 1. **MSRV / clippy：** CI 已跑 MSRV 1.89（含 clippy 与测试）；本备忘不再写「未在本机重跑 1.89」。
 2. **未打开** 远端 GitHub Actions 原始日志；CI 称绿处本文不重复断言。
-3. **`web/package.json` 仍标 0.7.0**：与 crate 0.8.0 不一致是否有意，未问产品方。
+3. **`web/package.json` 仍标 0.7.0**：与 crate 0.8.2 不一致是否有意，未问产品方。
 4. **Anthropic「合并相关操作为更少工具」** 与「按意图拆工具」存在张力：本 MVP 选择拆开以避免模型从 list 猜；是否对所有业务成立未做对照实验（C）。
 5. **外部 IDE 接 MCP** 未在本轮实测（留给后续排期后的调研）。
-6. 以已合入的 `origin/master` / 标签为准（`v0.8.0` → `60662425`；其后以 `v0.8.1` 为准）。
+6. 以已合入的 `origin/master` / 标签为准（crate tip **0.8.2** 树 `e6274143`；已打标签 `v0.8.1` → `fd9edbe9`；其前 `v0.8.0` → `60662425`）。
 
 ### 6.4 错误契约（结构化错误；**0.8.0 已落地，方案 A**）
 
@@ -308,12 +308,12 @@ Anthropic / AWS 工具写法强调：description 写清「做什么 / 何时用 
 
 **与空/错：** 诚实空仍成功+明确空；契约缺字段仍 fail-closed → `contract_mismatch`。不改变 §5.6。
 
-**本闸未做 / 之后：** 启动硬失败、Agent 按码分流、docs「双通道」句（约 L381）二选一、annotations、真模型验收（可同批或紧随）、RFC 9457 `problem+json` 全量字段。
+**本闸未做 / 之后：** 启动硬失败、Agent 按码分流、docs「双通道」句（§7.3.3）二选一、annotations、真模型验收（可同批或紧随）、RFC 9457 `problem+json` 全量字段。
 
 
 ## 7. Rust / MCP 实现取舍
 
-> 本章只谈实现：crate / bin 边界、MCP 工具怎么钉行为、测试钉什么。产品闸门、令牌运维、网页验收口径见其他章。基线：公开仓库 `cdzone/countdown_cli` crate **0.8.0**（MSRV 1.89，单 crate 多 bin）。
+> 本章只谈实现：crate / bin 边界、MCP 工具怎么钉行为、测试钉什么。产品闸门、令牌运维、网页验收口径见其他章。基线：公开仓库 `cdzone/countdown_cli` crate **0.8.2**（MSRV 1.89，单 crate 多 bin）。
 
 ### 7.1 本章范围
 
@@ -366,7 +366,7 @@ countdown_agent  ──Bearer(入口令牌)──▶  countdown_mcp  ──Beare
 - **共用 `CARGO_TARGET_DIR`**：本机多工具链（如 1.89 / 更新 stable）对照编译时，指向同一目录，避免每开一个沙箱就重新拉依赖；与「单 crate」一致——产物按包名共享，不按进程拆。
 - **新增依赖先报批**：`Cargo.toml` 里 MCP / Agent 相关依赖（如 `rmcp`、`async-openai`）进树前走评审；0.7.1 补丁刻意**不加**新直接依赖、**不改** `src/api.rs` CRUD，只在 MCP/Agent 层加工具与提示。
 
-### 7.3 MCP 层：签名、annotate / pick_next、互指如何落地
+### 7.3 MCP 层：签名、into_model / pick_next、互指如何落地
 
 #### 7.3.1 三个工具（按意图拆，不按「资源 CRUD」拆）
 
@@ -378,11 +378,11 @@ countdown_agent  ──Bearer(入口令牌)──▶  countdown_mcp  ──Beare
 
 意图写进 `#[tool(description = "...")]`，并互指：list 的 description 写「不要用本工具猜最近，去调 `get_next_countdown`」；next 的 description 写「不要用 `list_countdowns` 自己挑」。
 
-#### 7.3.2 `annotate` 与 `pick_next`（行为钉在纯函数）
+#### 7.3.2 `into_model` 与 `pick_next`（行为钉在纯函数）
 
 API **不**下发 `expired`。MCP 在出站前：
 
-- `annotate`：`next_remaining_seconds` 为负数 → `expired: true`；为 `None` → `expired: false`（诚实：算不出下次目标就不谎称过期）。
+- `into_model`：`next_remaining_seconds` 为负数 → `expired: true`；为 `None` → `expired: false`（诚实：算不出下次目标就不谎称过期）。
 - `is_upcoming`：`Some(s) if s >= 0`。
 - `pick_next`：过滤 upcoming 后 `min_by_key(next_remaining_seconds)`。Daily/Weekday 过点后 API 给出正向 `next_*`，故仍可被选中且 list 中 `expired: false`；**一次性**已过期（`next_remaining_seconds < 0`）才在 next 中被跳过、list 标 `expired: true`。
 - 出站视图：工具 JSON **不序列化** `remaining_seconds`；问「还有多久」只用 `next_*`。`next_*` 反序列化必填（缺字段 → 工具 `isError`）。
@@ -391,7 +391,7 @@ API **不**下发 `expired`。MCP 在出站前：
 
 #### 7.3.3 `instructions` 与 description 互指
 
-`initialize` 时 `with_instructions(MCP_INSTRUCTIONS)` + `with_server_info(countdown_cli / CARGO_PKG_VERSION)`：三句话复述「问最近 → next；问有哪些／过期 → list；已知 id → get」。与各工具 description 同口径，形成**双通道**：协议层 instructions + 工具级 description。工具无单独版号，行为变更随应用版本（如 `0.8.0`）发布。
+`initialize` 时 `with_instructions(MCP_INSTRUCTIONS)` + `with_server_info(countdown_cli / CARGO_PKG_VERSION)`：三句话复述「问最近 → next；问有哪些／过期 → list；已知 id → get」。与各工具 description 同口径，形成**双通道**：协议层 instructions + 工具级 description。工具无单独版号，行为变更随应用版本（如 `0.8.2`）发布。
 
 #### 7.3.4 Agent 侧再钉一层白名单
 
@@ -421,7 +421,7 @@ const TOOLS: [&str; 3] = ["list_countdowns", "get_countdown", "get_next_countdow
 | 缺工具检测 | `missing_tools` 列出缺的名字 | `missing_tools_lists_what_is_absent` |
 | 失败「查不到」 | `isError` / 401 / 零工具 / 超上限 → 固定中文文案，不把模型原文当答案 | agent 集成测若干条 |
 
-纯函数测（`annotate` / `pick_next`）不启服务器；工具测用本地假上游或真实回环 API。Agent 测用**假模型网关** + 真实 MCP/API，不断言 Ollama 是否「会说话」。
+纯函数测（`into_model` / `pick_next`）不启服务器；工具测用本地假上游或真实回环 API。Agent 测用**假模型网关** + 真实 MCP/API，不断言 Ollama 是否「会说话」。
 
 #### 7.4.2 为何不测模型话术
 

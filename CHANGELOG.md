@@ -6,6 +6,7 @@
 
 - **审计 detail 有用：** MCP 上游连不上时，审计 `detail` 不再拼 API URL，改为 `Display` + `source()` 链；`detail` 单独上限 512（caller/title/id 仍 64）。HTTP `internal`（写盘失败等）在丢弃错误前把原因写入 API 审计 `AuditLine.detail`；客户端体仍固定 `internal`。
 - **快照 version：** tools 快照有意保留 `serverInfo.version`，升版须同 PR 更新夹具（与 CHANGELOG / `Cargo.toml` 一并）。
+- **文档：** `docs/mvp-arch-lessons.md` 示例版号与 tip **0.8.2** 对齐；清过期行号（如「注释 L413–414」）与已更名的 `annotate`→`into_model`；§6.3 指针补 crate tip 树 `e6274143` / 标签 `v0.8.1`→`fd9edbe9`。
 
 ## 0.8.1
 
