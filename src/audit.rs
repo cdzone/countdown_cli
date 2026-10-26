@@ -51,14 +51,14 @@ pub fn error_chain(err: &dyn std::error::Error) -> String {
 
 /// Like [`error_chain`], but TOML parse errors keep only position + message
 /// (no source-line snippet that may contain titles or other config values).
+/// Every link in the `source()` chain goes through [`detail_piece`] so a wrap
+/// layer cannot re-expose a TOML source line via plain `Display`.
 /// IO and other errors stay full `Display` + `source()`.
 pub fn audit_detail_for_error(err: &(dyn std::error::Error + 'static)) -> String {
     let mut parts = vec![detail_piece(err)];
     let mut cur = err.source();
     while let Some(e) = cur {
-        // Deeper links are not `'static` on the trait object; TOML parse
-        // errors are leaves, so Display is enough for IO/reqwest chains.
-        parts.push(e.to_string());
+        parts.push(detail_piece(e));
         cur = e.source();
     }
     parts.join(": ")
@@ -212,6 +212,39 @@ mod tests {
         let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "perm-probe");
         let detail = audit_detail_for_error(&err);
         assert!(detail.contains("perm-probe"), "{detail}");
+    }
+
+    #[test]
+    fn audit_detail_strips_toml_through_wrap_source_chain() {
+        let bad = "title = \"TITLE-MARKER-91ab\n";
+        let leaf = bad.parse::<toml::Table>().unwrap_err();
+
+        #[derive(Debug)]
+        struct Wrap(toml::de::Error);
+        impl std::fmt::Display for Wrap {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "config reload failed")
+            }
+        }
+        impl std::error::Error for Wrap {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let detail = audit_detail_for_error(&Wrap(leaf));
+        assert!(
+            !detail.contains("TITLE-MARKER"),
+            "wrap must not re-expose config line via source Display: {detail}"
+        );
+        assert!(
+            detail.contains("line") && detail.contains("column"),
+            "should keep position through wrap: {detail}"
+        );
+        assert!(
+            detail.contains("config reload failed"),
+            "outer Display should remain: {detail}"
+        );
     }
     use serde_json::{json, Value};
 
