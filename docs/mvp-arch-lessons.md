@@ -1,11 +1,11 @@
 # countdown_cli MVP：架构与可复用经验（备忘）
 
-> 分享用定稿（随 **0.8.0** 方案 A / ModelView；**0.8.1** 快照接线；**0.8.2** 审计 detail；本文基线 tip **0.8.2**）。公开仓库 `cdzone/countdown_cli`。
+> 分享用定稿（随 **0.8.0** 方案 A / ModelView；**0.8.1** 快照接线；**0.8.2** 审计 detail；**0.8.3** 解析 detail 脱敏 + MCP 测收紧；**0.8.4** 错误链逐层 detail 脱敏 + README §6.1 措辞收窄与本文 scrub；本文基线 tip **0.8.4**）。公开仓库 `cdzone/countdown_cli`。
 > 只含本项目技术内容；可供他人审查对照。
 
 > **性质**：给后续真实传统业务对照的备忘，不是又一套需求文档。  
 > **合并文件**：本路径唯一正文；禁止另起平行页。  
-> **基线演进**：`v0.7.1` → `v0.7.2`（`next_*` fail-closed）→ `v0.7.3`（结构化 `error.code`）→ **`v0.8.0`**（方案 A：`HttpErrorCode` + MCP 映射；ModelView 无 `target_time`；契约快照初版）→ **`v0.8.1`**（快照接线 + 文案/审计诚实）→ **`v0.8.2`**（审计 detail：连不上/`internal` 原因可查；tools 快照有意留 version）。
+> **基线演进**：`v0.7.1` → `v0.7.2`（`next_*` fail-closed）→ `v0.7.3`（结构化 `error.code`）→ **`v0.8.0`**（方案 A：`HttpErrorCode` + MCP 映射；ModelView 无 `target_time`；契约快照初版）→ **`v0.8.1`**（快照接线 + 文案/审计诚实）→ **`v0.8.2`**（审计 detail：连不上/`internal` 原因可查；tools 快照有意留 version）→ **`v0.8.3`**（解析失败 detail 脱敏：不附出错行；MCP 连不上测收紧）→ **`v0.8.4`**（错误链逐层 detail 脱敏；文档：README §6.1「不含配置值」收窄；本备忘 / §6.3 指针 scrub）。
 
 ## 1. 结论先行
 
@@ -17,7 +17,7 @@
 
 ### 2.1 组件与入口（A）
 
-单 crate `countdown_cli`（`Cargo.toml`：`version = "0.8.2"`，`rust-version = "1.89"`，`default-run = "countdown_cli"`）。Cargo 自动发现 `src/bin/`：
+单 crate `countdown_cli`（`Cargo.toml`：`version = "0.8.4"`，`rust-version = "1.89"`，`default-run = "countdown_cli"`）。Cargo 自动发现 `src/bin/`：
 
 | 进程 | 路径 | 默认监听 | 职责 |
 |---|---|---|---|
@@ -25,7 +25,7 @@
 | `countdown_mcp` | `src/bin/countdown_mcp.rs` | `127.0.0.1:8765`，路径 `/mcp` | 只读 MCP；不碰配置文件；只调 API |
 | `countdown_agent` | `src/bin/countdown_agent.rs` + `src/bin/agent/agui.rs` | `--serve` → `127.0.0.1:8780` | 本机 OpenAI 兼容网关（默认 Ollama `:11434/v1`）+ MCP 客户端；可选 AG-UI `POST /agui` + `web/dist` 页面 |
 
-鉴权共享：`src/auth.rs`（令牌表 SHA-256）、`src/audit.rs`（JSON Lines）。网页：`web/`（`@ag-ui/client` 1.0.3；`package.json` 的 `"version": "0.7.0"` 与 crate 0.8.2 尚未对齐——见缺口）。
+鉴权共享：`src/auth.rs`（令牌表 SHA-256）、`src/audit.rs`（JSON Lines）。网页：`web/`（`@ag-ui/client` 1.0.3；`package.json` 的 `"version": "0.7.0"` 与 crate 0.8.4 尚未对齐——见缺口）。
 
 ### 2.2 边界（A）
 
@@ -70,7 +70,7 @@ Agent 侧白名单：`TOOLS: [&str; 3]`；`connect_mcp` 过滤后只把这三项
 | 工具 `description` | 各 `#[tool(description = "...")]` | **互指**：list 写明勿用于猜最近；get_next 写明勿用 list 代替 |
 | Agent `SYSTEM_PROMPT` | `countdown_agent.rs` | 中文复述同一分工；白名单再兜一层 |
 
-规范侧：MCP Tool 字段含 `name` / `description` / `inputSchema` 等，**无 per-tool `version`**（B：https://modelcontextprotocol.io/specification/2025-11-25/server/tools）。行为变更随应用版本（如 0.8.2）发布——与 README §4.3 一致（A）。
+规范侧：MCP Tool 字段含 `name` / `description` / `inputSchema` 等，**无 per-tool `version`**（B：https://modelcontextprotocol.io/specification/2025-11-25/server/tools）。行为变更随应用版本（如 0.8.4）发布——与 README §4.3 一致（A）。
 
 ## 3. 关键设计取舍
 
@@ -197,7 +197,7 @@ Anthropic / AWS 工具写法强调：description 写清「做什么 / 何时用 
 
 ## 5. 「业务系统接 AI」学习要点
 
-> 基线同备忘 `v0.8.2`（叠 `v0.8.1` / `v0.8.0` 方案 A）。只写可迁移的学习对照。与「闸门与缝」互补：那边钉工程缝，这边钉**怎么练、怎么验收自己学会了**。
+> 基线同备忘 `v0.8.4`（叠 `v0.8.3` / `v0.8.2` / `v0.8.1` / `v0.8.0` 方案 A）。只写可迁移的学习对照。与「闸门与缝」互补：那边钉工程缝，这边钉**怎么练、怎么验收自己学会了**。
 
 ### 5.1 先建立心智模型（三层）
 
@@ -277,10 +277,10 @@ Anthropic / AWS 工具写法强调：description 写清「做什么 / 何时用 
 
 1. **MSRV / clippy：** CI 已跑 MSRV 1.89（含 clippy 与测试）；本备忘不再写「未在本机重跑 1.89」。
 2. **未打开** 远端 GitHub Actions 原始日志；CI 称绿处本文不重复断言。
-3. **`web/package.json` 仍标 0.7.0**：与 crate 0.8.2 不一致是否有意，未问产品方。
+3. **`web/package.json` 仍标 0.7.0**：与 crate 0.8.4 不一致是否有意，未问产品方。
 4. **Anthropic「合并相关操作为更少工具」** 与「按意图拆工具」存在张力：本 MVP 选择拆开以避免模型从 list 猜；是否对所有业务成立未做对照实验（C）。
 5. **外部 IDE 接 MCP** 未在本轮实测（留给后续排期后的调研）。
-6. 以已合入的 `origin/master` / 标签为准（crate tip **0.8.2** 树 `e6274143`；已打标签 `v0.8.1` → `fd9edbe9`；其前 `v0.8.0` → `60662425`）。
+6. 以已合入的 `origin/master` / 标签为准（已打标签 `v0.8.3` → `bdfcbf35`，树 `a0f0f170`；其前 `v0.8.1` → `fd9edbe9`；`v0.8.0` → `60662425`。本拍 **0.8.4** 码+文档小改叠其上，待打标）。
 
 ### 6.4 错误契约（结构化错误；**0.8.0 已落地，方案 A**）
 
@@ -313,7 +313,7 @@ Anthropic / AWS 工具写法强调：description 写清「做什么 / 何时用 
 
 ## 7. Rust / MCP 实现取舍
 
-> 本章只谈实现：crate / bin 边界、MCP 工具怎么钉行为、测试钉什么。产品闸门、令牌运维、网页验收口径见其他章。基线：公开仓库 `cdzone/countdown_cli` crate **0.8.2**（MSRV 1.89，单 crate 多 bin）。
+> 本章只谈实现：crate / bin 边界、MCP 工具怎么钉行为、测试钉什么。产品闸门、令牌运维、网页验收口径见其他章。基线：公开仓库 `cdzone/countdown_cli` crate **0.8.4**（MSRV 1.89，单 crate 多 bin）。
 
 ### 7.1 本章范围
 
@@ -391,7 +391,7 @@ API **不**下发 `expired`。MCP 在出站前：
 
 #### 7.3.3 `instructions` 与 description 互指
 
-`initialize` 时 `with_instructions(MCP_INSTRUCTIONS)` + `with_server_info(countdown_cli / CARGO_PKG_VERSION)`：三句话复述「问最近 → next；问有哪些／过期 → list；已知 id → get」。与各工具 description 同口径，形成**双通道**：协议层 instructions + 工具级 description。工具无单独版号，行为变更随应用版本（如 `0.8.2`）发布。
+`initialize` 时 `with_instructions(MCP_INSTRUCTIONS)` + `with_server_info(countdown_cli / CARGO_PKG_VERSION)`：三句话复述「问最近 → next；问有哪些／过期 → list；已知 id → get」。与各工具 description 同口径，形成**双通道**：协议层 instructions + 工具级 description。工具无单独版号，行为变更随应用版本（如 `0.8.4`）发布。
 
 #### 7.3.4 Agent 侧再钉一层白名单
 

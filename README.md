@@ -130,7 +130,7 @@ MCP 入口的 `Origin` 校验：请求不带 `Origin` 放行；带了但不是 `
 | `list_countdowns` | 默认仍返回全部（可用 `within_hours` / `include_disabled` 过滤）；按 `next_remaining_seconds` 排序；每条带服务端算的 `expired`。问「有哪些／哪些过期了」用它；**不要**用它来猜最近。 |
 | `get_countdown` | 按 id 取一条（出站字段含 `next_*`，不含 `remaining_seconds`）。 |
 
-服务端 `initialize` 的 `instructions` 用三句话复述上述分工。工具无单独版号，行为变更随应用版本（如 `0.8.2`）发布。
+服务端 `initialize` 的 `instructions` 用三句话复述上述分工。工具无单独版号，行为变更随应用版本（如 `0.8.4`）发布。
 
 ## 5. 认证与失败返回
 
@@ -174,7 +174,7 @@ JSON Lines，一行一条记录，权限 0600。API 和 MCP 各写各的文件�
 
 ### 6.1 字段
 
-`ts`（本地时间，RFC 3339 带偏移）、`svc`（`api` / `mcp`）、`phase`、`request_id`、`caller`（认出的令牌 `id`，认证失败为 `null`）、`on_behalf_of`（仅 API，取 `X-Countdown-Caller`，自称未验证，最长 64 字符）、`action`（API 为方法加路由模板，如 `DELETE /countdowns/{id}`；MCP 工具调用为 `tool:<名字>`，启动探测为 `probe:GET /countdowns`，入口 401 和坏 Origin 的 403 记 `http:<方法> <实际路径>`，如 `http:POST /mcp`、`http:GET /nope`；路径是客户端随意给的，只留前 64 个字符（按字符截，不拆 UTF-8））、`target`（提醒 id）、`params`（参数摘要；API 写请求只记出现了哪些字段和 `title_len`，不记值）、`outcome`、`auth_fail`（`missing` / `malformed` / `unknown_token` / `insufficient_scope` / `bad_origin`）、`status`、`is_error`（仅 MCP 工具调用）、`upstream_status`（仅 MCP，上游返回了状态码时）、`detail`（运维侧失败原因，最长 512 字符；有则只进审计文件 0600，**不上** HTTP/MCP 响应体与模型文案。内容为错误链；配置 TOML/`toml_edit` 解析失败时只记位置（line/column）与错误类型/message，不附出错行原文，故不含标题等配置值；IO/连不上等非解析错误仍记完整链。不记令牌、请求体/响应体原文）、`duration_ms`。MCP 入口拒绝的行每条新生成一个 `request_id`，`params` 为 `null`。
+`ts`（本地时间，RFC 3339 带偏移）、`svc`（`api` / `mcp`）、`phase`、`request_id`、`caller`（认出的令牌 `id`，认证失败为 `null`）、`on_behalf_of`（仅 API，取 `X-Countdown-Caller`，自称未验证，最长 64 字符）、`action`（API 为方法加路由模板，如 `DELETE /countdowns/{id}`；MCP 工具调用为 `tool:<名字>`，启动探测为 `probe:GET /countdowns`，入口 401 和坏 Origin 的 403 记 `http:<方法> <实际路径>`，如 `http:POST /mcp`、`http:GET /nope`；路径是客户端随意给的，只留前 64 个字符（按字符截，不拆 UTF-8））、`target`（提醒 id）、`params`（参数摘要；API 写请求只记出现了哪些字段和 `title_len`，不记值）、`outcome`、`auth_fail`（`missing` / `malformed` / `unknown_token` / `insufficient_scope` / `bad_origin`）、`status`、`is_error`（仅 MCP 工具调用）、`upstream_status`（仅 MCP，上游返回了状态码时）、`detail`（运维侧失败原因，最长 512 字符；有则只进审计文件 0600，**不上** HTTP/MCP 响应体与模型文案。内容为错误链；配置 TOML/`toml_edit` **解析失败**时只记位置（line/column）与错误类型/message，**不附出错行原文**，故不含标题等行内配置值；**类型/业务校验**失败（如 `repeat` 拼错、`enabled` 类型错）的说明文案可能引用该字段的值（非敏感）。IO/连不上等非解析错误仍记完整链。不记令牌、请求体/响应体原文）、`duration_ms`。MCP 入口拒绝的行每条新生成一个 `request_id`，`params` 为 `null`。
 
 **绝不记**：`Authorization` 头、令牌明文、令牌摘要或其任何前缀、请求体和响应体原文、上游错误 body。
 

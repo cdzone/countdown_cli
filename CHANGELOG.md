@@ -6,6 +6,7 @@
 
 - **审计 detail 链脱敏：** `audit_detail_for_error` 对 `source()` **每一层**走 `detail_piece`（可 downcast TOML/`toml_edit`），不再只剥最外层；删掉「更深层非 `'static`」误注释。包一层 Wrap 包住 `toml::de::Error` 时，detail 仍无出错行原文、仍有 line/column。不改对外 HTTP/MCP 契约。
 - **快照 version：** tools 夹具 `serverInfo.version` → 0.8.4。
+- **文档：** README §6.1 `detail` 措辞收窄——配置 TOML/`toml_edit` **解析失败**仍只记位置+类型/message、不附出错行（不含标题等行内值）；**类型/业务校验**失败的说明可能引用该字段的值（如 `repeat`/`enabled`，非敏感）。`docs/mvp-arch-lessons.md` 跟到 0.8.3/0.8.4；§6.3 第 6 条改指标签 `v0.8.3`（tip `bdfcbf35` / 树 `a0f0f170`）。
 
 ## 0.8.3
 
