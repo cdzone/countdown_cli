@@ -644,8 +644,10 @@ impl CountdownMcp {
                 message,
                 detail,
             };
-        // Detail is for operators only: no URL (api_url is already in config),
-        // and walk source() so connection refused / TLS causes survive truncation.
+        // Detail is for operators only: walk Display+source() (error_chain).
+        // We do not prepend api_url ourselves; reqwest's Display may still
+        // contain `for url (…)`. Prefer source-chain fragments (tcp connect /
+        // os error) over the top-level Display alone.
         let resp = self.get(url, up).send().await.map_err(|e| {
             fail(
                 Outcome::UpstreamUnreachable,
@@ -1681,12 +1683,13 @@ mod tests {
             "detail must not lead with the API URL: {detail}"
         );
         let lower = detail.to_ascii_lowercase();
+        // Require source-chain fragments: bare `e.to_string()` is only
+        // `error sending request for url (…)`, which lacks these.
         assert!(
-            lower.contains("refused")
-                || lower.contains("connect")
-                || lower.contains("error sending request")
-                || lower.contains("connection"),
-            "detail should keep a connect-class reason: {detail}"
+            lower.contains("tcp connect")
+                || lower.contains("os error")
+                || lower.contains("actively refused"),
+            "detail must keep a source-chain connect reason (not top-level Display alone): {detail}"
         );
         assert!(
             detail.chars().count() <= countdown_cli::audit::MAX_AUDIT_DETAIL,

@@ -11,7 +11,7 @@ use axum::{
 };
 use chrono::{Local, NaiveDateTime};
 use countdown_cli::{
-    audit::{error_chain, truncated, truncated_detail, AuditLog},
+    audit::{audit_detail_for_error, truncated, truncated_detail, AuditLog},
     auth::{bearer_challenge, Principal, Scope, TokenTable},
     error::HttpErrorCode,
     CountdownUpdateError,
@@ -540,7 +540,7 @@ async fn create_countdown(
             });
             (StatusCode::CREATED, Json(api)).into_response()
         }
-        Err(e) => internal_error(error_chain(e.as_ref())),
+        Err(e) => internal_error(audit_detail_for_error(e.as_ref())),
     }
 }
 
@@ -584,7 +584,7 @@ async fn delete_countdown(
             "Countdown not found",
             StatusCode::NOT_FOUND,
         ),
-        Err(e) => internal_error(error_chain(e.as_ref())),
+        Err(e) => internal_error(audit_detail_for_error(e.as_ref())),
     }
 }
 
@@ -1438,6 +1438,76 @@ datetime = "2026-12-31 00:00:00"
             attempt["params"],
             serde_json::json!({"fields": ["title", "datetime"], "title_len": marker.len()})
         );
+    }
+
+    /// Corrupt config (title line missing closing quote) → write → 500; audit
+    /// detail must keep parse position/type but never the title marker.
+    #[tokio::test]
+    async fn corrupt_config_write_audit_detail_has_no_title() {
+        let marker = "TITLE-MARKER-91ab";
+        let (router, _store, _dir, path) = setup_router_with_file(&sample_toml()).await;
+        // Break the on-disk TOML after the store loaded a good file.
+        let broken = format!(
+            "[[countdown]]\ntitle = \"{marker}\ndatetime = \"2026-12-31 18:00:00\"\nenabled = true\n"
+        );
+        fs::write(&path, &broken).unwrap();
+
+        let body = r#"{"title":"x","datetime":"2026-11-01 12:00:00","enabled":true}"#;
+        for (method, url) in [
+            ("POST", "/countdowns".to_string()),
+            ("PUT", "/countdowns/does-not-matter".to_string()),
+            ("DELETE", "/countdowns/does-not-matter".to_string()),
+        ] {
+            let r = send(
+                &router,
+                method,
+                &url,
+                &[("authorization", WRITE_AUTH)],
+                if method == "DELETE" { "" } else { body },
+            )
+            .await;
+            assert_eq!(
+                r.status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{method} {url}"
+            );
+            assert!(
+                r.body.contains("\"code\":\"internal\"") || r.body.contains("\"internal\""),
+                "body still fixed internal: {}",
+                r.body
+            );
+        }
+
+        let text = fs::read_to_string(audit_path(&path)).unwrap();
+        assert!(
+            !text.contains(marker),
+            "audit must not hold config title marker: {text}"
+        );
+        let lines = audit_lines(&path);
+        let results: Vec<_> = lines
+            .iter()
+            .filter(|l| l["phase"] == "result" && l["status"] == 500)
+            .collect();
+        assert!(
+            results.len() >= 3,
+            "expected ≥3 result lines with 500, got {}",
+            results.len()
+        );
+        for result in results {
+            let detail = result["detail"].as_str().expect("detail present");
+            assert!(!detail.contains(marker), "{detail}");
+            let lower = detail.to_ascii_lowercase();
+            assert!(
+                (lower.contains("line") && lower.contains("column"))
+                    || lower.contains("bytes")
+                    || lower.contains("toml parse"),
+                "detail should keep parse position: {detail}"
+            );
+            assert!(
+                lower.contains("invalid") || lower.contains("expected") || lower.contains("parse"),
+                "detail should keep error type/message: {detail}"
+            );
+        }
     }
 
     fn fixtures_dir() -> std::path::PathBuf {
