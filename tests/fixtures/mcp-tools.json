@@ -2,7 +2,7 @@
   "instructions": "Read-only countdown tools. Ask which is next/nearest/soon due / how long until → get_next_countdown (server picks one; empty means none upcoming; use next_target_time and next_remaining_seconds only). Ask what exists / which expired / browse → list_countdowns (default returns all; each item has expired; remaining time fields are next_*). Known id → get_countdown. Do not use list_countdowns to guess the nearest item.",
   "serverInfo": {
     "name": "countdown_cli",
-    "version": "0.8.3"
+    "version": "0.8.4"
   },
   "tools": [
     {
