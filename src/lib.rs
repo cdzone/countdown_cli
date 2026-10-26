@@ -422,14 +422,14 @@ impl CountdownStore {
         repeat: Option<RepeatMode>,
     ) -> Result<Countdown, CountdownUpdateError> {
         let _guard = self.write_lock.lock().await;
-        self.sync_from_disk_if_stale_locked()
-            .await
-            .map_err(|e| CountdownUpdateError::Other(e.to_string()))?;
+        self.sync_from_disk_if_stale_locked().await.map_err(|e| {
+            CountdownUpdateError::Other(crate::audit::audit_detail_for_error(e.as_ref()))
+        })?;
         let original = std::fs::read_to_string(&self.file_path)
-            .map_err(|e| CountdownUpdateError::Other(e.to_string()))?;
+            .map_err(|e| CountdownUpdateError::Other(crate::audit::audit_detail_for_error(&e)))?;
         let mut doc = original
             .parse::<toml_edit::DocumentMut>()
-            .map_err(|e| CountdownUpdateError::Other(e.to_string()))?;
+            .map_err(|e| CountdownUpdateError::Other(crate::audit::audit_detail_for_error(&e)))?;
         // 找到带id的表并替换字段
         let mut found = false;
         if let Some(arr) = doc
@@ -468,9 +468,9 @@ impl CountdownStore {
         }
         let tmp = self.unique_tmp_path();
         std::fs::write(&tmp, doc.to_string())
-            .map_err(|e| CountdownUpdateError::Other(e.to_string()))?;
+            .map_err(|e| CountdownUpdateError::Other(crate::audit::audit_detail_for_error(&e)))?;
         std::fs::rename(&tmp, &self.file_path)
-            .map_err(|e| CountdownUpdateError::Other(e.to_string()))?;
+            .map_err(|e| CountdownUpdateError::Other(crate::audit::audit_detail_for_error(&e)))?;
         {
             let mut data = self.data.write().await;
             if let Some(existing) = data

@@ -2,6 +2,13 @@
 
 本文件记录对外契约与版本边界。契约快照（`tests/fixtures/mcp-*.json`、`http-error-bodies.json`）变更时须同步更新本文件并决定版本号。
 
+## 0.8.3
+
+- **审计 detail 脱敏：** 配置 TOML/`toml_edit` 解析失败写入审计 `detail` 时，只保留位置（line/column）与错误类型/message，不再附带出错行原文（避免标题等配置值进审计）。IO 错误仍完整记录。集中在 `audit_detail_for_error`；写路径（create/update/delete）统一走它。扩展测：损坏配置后 POST/PUT/DELETE → 500，审计全文不含标题标记。
+- **MCP 连不上测收紧：** `upstream_unreachable_audit_detail_keeps_connect_reason` 改为要求 source 链片段（`tcp connect` / `os error` / `actively refused`）；裸 `e.to_string()`（仅顶层 Display）不能过。注释改准：代码不自拼 URL；reqwest Display 仍可能含 `for url (…)`。
+- **快照 version：** tools 夹具 `serverInfo.version` → 0.8.3（有意保留 version 字段）。
+- **文档：** README §6.1 补审计字段 `detail`（记什么/不记值；不上客户端）。
+
 ## 0.8.2
 
 - **审计 detail 有用：** MCP 上游连不上时，审计 `detail` 不再拼 API URL，改为 `Display` + `source()` 链；`detail` 单独上限 512（caller/title/id 仍 64）。HTTP `internal`（写盘失败等）在丢弃错误前把原因写入 API 审计 `AuditLine.detail`；客户端体仍固定 `internal`。

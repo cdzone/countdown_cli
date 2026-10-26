@@ -49,6 +49,47 @@ pub fn error_chain(err: &dyn std::error::Error) -> String {
     parts.join(": ")
 }
 
+/// Like [`error_chain`], but TOML parse errors keep only position + message
+/// (no source-line snippet that may contain titles or other config values).
+/// IO and other errors stay full `Display` + `source()`.
+pub fn audit_detail_for_error(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = vec![detail_piece(err)];
+    let mut cur = err.source();
+    while let Some(e) = cur {
+        // Deeper links are not `'static` on the trait object; TOML parse
+        // errors are leaves, so Display is enough for IO/reqwest chains.
+        parts.push(e.to_string());
+        cur = e.source();
+    }
+    parts.join(": ")
+}
+
+fn detail_piece(err: &(dyn std::error::Error + 'static)) -> String {
+    if let Some(e) = err.downcast_ref::<toml::de::Error>() {
+        return format_toml_parse(&e.to_string(), e.message(), e.span());
+    }
+    if let Some(e) = err.downcast_ref::<toml_edit::TomlError>() {
+        return format_toml_parse(&e.to_string(), e.message(), e.span());
+    }
+    err.to_string()
+}
+
+/// Prefer "TOML parse error at line N, column M: message"; never copy the
+/// offending source line from the crate Display.
+fn format_toml_parse(display: &str, message: &str, span: Option<std::ops::Range<usize>>) -> String {
+    let first = display.lines().next().unwrap_or("");
+    if first.starts_with("TOML parse error at line") {
+        format!("{first}: {message}")
+    } else if let Some(span) = span {
+        format!(
+            "TOML parse error at bytes {}..{}: {message}",
+            span.start, span.end
+        )
+    } else {
+        format!("TOML parse error: {message}")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AuditLog {
     path: PathBuf,
@@ -128,6 +169,49 @@ mod tests {
         }
 
         assert_eq!(error_chain(&Wrap(Leaf)), "wrap: leaf-reason");
+    }
+
+    #[test]
+    fn audit_detail_strips_toml_source_line_keeps_position() {
+        let bad = "title = \"TITLE-MARKER-91ab\n";
+        let err = bad.parse::<toml::Table>().unwrap_err();
+        let detail = audit_detail_for_error(&err);
+        assert!(
+            !detail.contains("TITLE-MARKER"),
+            "must not copy config line: {detail}"
+        );
+        assert!(
+            detail.contains("line") && detail.contains("column"),
+            "should keep position: {detail}"
+        );
+        assert!(
+            detail.to_ascii_lowercase().contains("invalid basic string")
+                || detail.contains("expected"),
+            "should keep error type/message: {detail}"
+        );
+    }
+
+    #[test]
+    fn audit_detail_strips_toml_edit_source_line() {
+        let bad = "title = \"TITLE-MARKER-91ab\n";
+        let err = bad.parse::<toml_edit::DocumentMut>().unwrap_err();
+        let detail = audit_detail_for_error(&err);
+        assert!(!detail.contains("TITLE-MARKER"), "{detail}");
+        assert!(
+            detail.contains("line") || detail.contains("bytes"),
+            "{detail}"
+        );
+        assert!(
+            detail.to_ascii_lowercase().contains("invalid basic string"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn audit_detail_keeps_io_reason() {
+        let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "perm-probe");
+        let detail = audit_detail_for_error(&err);
+        assert!(detail.contains("perm-probe"), "{detail}");
     }
     use serde_json::{json, Value};
 
